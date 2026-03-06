@@ -44,6 +44,9 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
     
     // Pending permission request invoke to resolve after user responds
     private var pendingPermissionInvoke: Invoke? = null
+    private val permissionRequestHandler = Handler(Looper.getMainLooper())
+    private var permissionPollRunnable: Runnable? = null
+    private var permissionRequestDeadlineMs: Long = 0L
     
     // maxDuration handling
     private var maxDurationHandler: Handler? = null
@@ -98,7 +101,12 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         // Cancel restart handler
         restartHandler.removeCallbacksAndMessages(null)
         Log.d(TAG, "  Restart handler cancelled")
-        
+
+        permissionPollRunnable?.let { permissionRequestHandler.removeCallbacks(it) }
+        permissionPollRunnable = null
+        pendingPermissionInvoke = null
+        permissionRequestDeadlineMs = 0L
+
         // Reset error tracking
         consecutiveErrors = 0
         lastErrorTime = 0L
@@ -120,31 +128,10 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         cleanup()
     }
     
-    /**
-     * Handle permission request results.
-     * Uses Tauri's PermissionState system instead of deprecated onRequestPermissionsResult.
-     */
-    @Deprecated("Use PermissionState from Tauri instead")
-    private fun handlePermissionResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        
+    fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         if (requestCode == PERMISSION_REQUEST_CODE) {
             val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-            
-            pendingPermissionInvoke?.let { invoke ->
-                val result = JSObject()
-                if (granted) {
-                    result.put("microphone", "granted")
-                    result.put("speechRecognition", "granted")
-                } else {
-                    val canRequest = ActivityCompat.shouldShowRequestPermissionRationale(
-                        activity, Manifest.permission.RECORD_AUDIO
-                    )
-                    result.put("microphone", if (canRequest) "denied" else "permanently_denied")
-                    result.put("speechRecognition", if (canRequest) "denied" else "permanently_denied")
-                }
-                invoke.resolve(result)
-                pendingPermissionInvoke = null
-            }
+            resolvePendingPermissionRequest(granted)
         }
     }
 
@@ -157,13 +144,8 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         if (ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            Log.w(TAG, "Microphone permission not granted, requesting...")
-            ActivityCompat.requestPermissions(
-                activity,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                PERMISSION_REQUEST_CODE
-            )
-            invoke.reject("Microphone permission required. Please grant permission and try again.")
+            Log.w(TAG, "Microphone permission not granted")
+            invoke.reject("Microphone permission required. Call requestPermission() first.")
             return
         }
         Log.d(TAG, "Microphone permission granted")
@@ -539,8 +521,13 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
 
-        // Store invoke to resolve after user responds to permission dialog
+        if (pendingPermissionInvoke != null) {
+            invoke.reject("Permission request already in progress")
+            return
+        }
+
         pendingPermissionInvoke = invoke
+        permissionRequestDeadlineMs = System.currentTimeMillis() + 30_000L
         Log.d(TAG, "  Requesting RECORD_AUDIO permission...")
 
         ActivityCompat.requestPermissions(
@@ -549,7 +536,52 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
             PERMISSION_REQUEST_CODE
         )
         Log.d(TAG, "  Permission dialog shown, waiting for result...")
-        // Don't resolve here - wait for onRequestPermissionsResult callback
+        startPermissionPolling()
+    }
+
+    private fun startPermissionPolling() {
+        permissionPollRunnable?.let { permissionRequestHandler.removeCallbacks(it) }
+
+        permissionPollRunnable = object : Runnable {
+            override fun run() {
+                if (pendingPermissionInvoke == null) {
+                    permissionPollRunnable = null
+                    return
+                }
+
+                val granted = ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                if (granted) {
+                    resolvePendingPermissionRequest(true)
+                    return
+                }
+
+                if (System.currentTimeMillis() >= permissionRequestDeadlineMs) {
+                    resolvePendingPermissionRequest(false)
+                    return
+                }
+
+                permissionRequestHandler.postDelayed(this, 250L)
+            }
+        }
+
+        permissionRequestHandler.postDelayed(permissionPollRunnable!!, 250L)
+    }
+
+    private fun resolvePendingPermissionRequest(granted: Boolean) {
+        permissionPollRunnable?.let { permissionRequestHandler.removeCallbacks(it) }
+        permissionPollRunnable = null
+
+        pendingPermissionInvoke?.let { invoke ->
+            val result = JSObject()
+            val status = if (granted) "granted" else "denied"
+            result.put("microphone", status)
+            result.put("speechRecognition", status)
+            invoke.resolve(result)
+        }
+
+        pendingPermissionInvoke = null
+        permissionRequestDeadlineMs = 0L
     }
 
     private fun createRecognizerIntent(config: ListenConfig): Intent {
