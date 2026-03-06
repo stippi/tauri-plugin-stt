@@ -129,6 +129,22 @@ pub struct Stt<R: Runtime> {
 }
 
 impl<R: Runtime> Stt<R> {
+    fn complete_result_text(result: vosk::CompleteResult) -> String {
+        match result {
+            vosk::CompleteResult::Single(single) => single.text.to_string(),
+            vosk::CompleteResult::Multiple(multiple) => multiple
+                .alternatives
+                .first()
+                .map(|alt| alt.text.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn emit_result(&self, result: &RecognitionResult) {
+        let _ = self.app.emit("stt://result", result);
+        let _ = self.app.emit("plugin:stt:result", result);
+    }
+
     fn get_models_dir(&self) -> PathBuf {
         self.app
             .path()
@@ -363,10 +379,6 @@ impl<R: Runtime> Stt<R> {
         // Drop existing model if switching
         state.model = None;
         state.current_model_name = None;
-        // Also invalidate the audio processor since it has the old recognizer
-        state.audio_processor = None;
-        state.stream_created = false;
-
         drop(state);
 
         // Download model if needed
@@ -387,6 +399,18 @@ impl<R: Runtime> Stt<R> {
         let mut state = self.state.lock().unwrap();
         state.model = Some(model.clone());
         state.current_model_name = Some(model_name.to_string());
+        if let Some(processor) = &state.audio_processor {
+            if let Ok(mut proc) = processor.lock() {
+                let target_sample_rate = 16000.0;
+                if let Some(mut recognizer) = Recognizer::new(&model, target_sample_rate) {
+                    recognizer.set_max_alternatives(1);
+                    recognizer.set_partial_words(proc.interim_results);
+                    proc.buffer.clear();
+                    proc.last_partial.clear();
+                    proc.recognizer = recognizer;
+                }
+            }
+        }
 
         Ok(model)
     }
@@ -454,7 +478,7 @@ impl<R: Runtime> Stt<R> {
 
             state.audio_processor = Some(audio_processor.clone());
 
-            let app_handle = self.app.clone();
+            let stt = self.app.clone();
             let processor_for_callback = audio_processor.clone();
 
             let process_audio = move |samples_i16: Vec<i16>| {
@@ -496,15 +520,7 @@ impl<R: Runtime> Stt<R> {
                 let is_final = matches!(result, Ok(vosk::DecodingState::Finalized));
 
                 if is_final {
-                    let result = processor.recognizer.result();
-                    let text = match result {
-                        vosk::CompleteResult::Single(single) => single.text.to_string(),
-                        vosk::CompleteResult::Multiple(multiple) => multiple
-                            .alternatives
-                            .first()
-                            .map(|alt| alt.text.to_string())
-                            .unwrap_or_default(),
-                    };
+                    let text = Self::complete_result_text(processor.recognizer.result());
 
                     if !text.is_empty() {
                         processor.last_partial = String::new();
@@ -514,8 +530,8 @@ impl<R: Runtime> Stt<R> {
                             is_final: true,
                             confidence: Some(1.0),
                         };
-                        let _ = app_handle.emit("stt://result", &result);
-                        let _ = app_handle.emit("plugin:stt:result", &result);
+                        let _ = stt.emit("stt://result", &result);
+                        let _ = stt.emit("plugin:stt:result", &result);
                     }
                 } else if processor.interim_results {
                     let partial = processor.recognizer.partial_result();
@@ -528,8 +544,8 @@ impl<R: Runtime> Stt<R> {
                             is_final: false,
                             confidence: None,
                         };
-                        let _ = app_handle.emit("stt://result", &result);
-                        let _ = app_handle.emit("plugin:stt:result", &result);
+                        let _ = stt.emit("stt://result", &result);
+                        let _ = stt.emit("plugin:stt:result", &result);
                     }
                 }
             };
@@ -613,9 +629,10 @@ impl<R: Runtime> Stt<R> {
 
             state.stream_created = true;
 
-            // Keep the stream alive using mem::forget
-            // The stream callback checks the session ID and only processes audio
-            // when a session is active (session_id != 0)
+            // Keep the stream alive for the process lifetime.
+            // The callback consults CURRENT_SESSION_ID and only processes audio
+            // when a session is active. Model switches reuse the existing processor
+            // instead of spawning a new stream.
             std::mem::forget(stream);
         } else {
             // Reuse existing stream - just reset the audio processor state
@@ -700,6 +717,37 @@ impl<R: Runtime> Stt<R> {
             return Ok(());
         }
 
+        let final_result = state.audio_processor.as_ref().and_then(|processor| {
+            let mut proc = processor.lock().ok()?;
+
+            if !proc.buffer.is_empty() {
+                let samples_to_process: Vec<i16> = proc.buffer.drain(..).collect();
+                let resampled: Vec<i16> = if proc.resample_step > 1 {
+                    samples_to_process
+                        .iter()
+                        .step_by(proc.resample_step)
+                        .copied()
+                        .collect()
+                } else {
+                    samples_to_process
+                };
+                let _ = proc.recognizer.accept_waveform(&resampled);
+            }
+
+            let text = Self::complete_result_text(proc.recognizer.final_result());
+            proc.last_partial.clear();
+
+            if text.is_empty() {
+                None
+            } else {
+                Some(RecognitionResult {
+                    transcript: text,
+                    is_final: true,
+                    confidence: Some(1.0),
+                })
+            }
+        });
+
         // Set session to 0 to signal audio callback to stop processing
         // (but the stream itself keeps running for reuse)
         CURRENT_SESSION_ID.store(0, Ordering::SeqCst);
@@ -708,6 +756,11 @@ impl<R: Runtime> Stt<R> {
         state.listen_start_time = None;
         state.max_duration_ms = None;
         state.active_session_id = 0;
+        drop(state);
+
+        if let Some(result) = final_result.as_ref() {
+            self.emit_result(result);
+        }
 
         // Emit stateChange event
         let _ = self.app.emit(
@@ -723,9 +776,14 @@ impl<R: Runtime> Stt<R> {
     }
 
     pub fn is_available(&self) -> crate::Result<AvailabilityResponse> {
+        let available = cpal::default_host().default_input_device().is_some();
         Ok(AvailabilityResponse {
-            available: true,
-            reason: None,
+            available,
+            reason: if available {
+                None
+            } else {
+                Some("No input audio device available".to_string())
+            },
         })
     }
 
