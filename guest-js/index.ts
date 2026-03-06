@@ -183,14 +183,45 @@ export async function onError(
 }
 
 /**
- * Detect if we're running on mobile platform
- * Mobile uses channel-based listeners, desktop uses event system
+ * Debug event from native platform implementations
+ */
+export interface DebugEvent {
+  /** Source of the debug message (e.g. "ios", "android") */
+  source: string;
+  /** Debug message */
+  message: string;
+}
+
+/**
+ * Listen for debug messages from native STT implementations.
+ * Useful for diagnosing issues on iOS/Android.
+ */
+export async function onDebug(
+  handler: (event: DebugEvent) => void
+): Promise<PluginListener | UnlistenFn> {
+  const isMobile = isMobilePlatform();
+
+  if (isMobile) {
+    return await addPluginListener<DebugEvent>("stt", "debug", handler);
+  }
+
+  return await listen<DebugEvent>("plugin:stt:debug", event => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * Detect if we're running on mobile platform.
+ * Mobile uses channel-based listeners, desktop uses event system.
+ *
+ * iPadOS 13+ reports a macOS user agent by default ("Request Desktop Website"),
+ * so we cannot rely on navigator.userAgent for iPad detection.
+ * Instead we use Tauri's internal platform detection and iOS-specific APIs.
  */
 function isMobilePlatform(): boolean {
-  // Check for mobile-specific Tauri internals and Android WebView
   const w = window as any;
 
-  // Check Tauri's internal platform detection first
+  // Check Tauri's internal platform detection first (most reliable)
   const platform = w.__TAURI_INTERNALS__?.plugins?.os?.platform;
   if (platform === "android" || platform === "ios") {
     return true;
@@ -201,11 +232,19 @@ function isMobilePlatform(): boolean {
     return true;
   }
 
-  // Check for iOS-specific WebKit (but not macOS)
-  // iOS has webkit.messageHandlers AND navigator.userAgent contains "iPhone" or "iPad"
+  // Detect iOS/iPadOS via webkit.messageHandlers + touch support.
+  // On iPadOS, navigator.userAgent reports macOS, so we can't rely on UA parsing.
+  // Instead: webkit.messageHandlers exists on both macOS and iOS in WKWebView,
+  // but we combine it with touch support and navigator.maxTouchPoints to
+  // distinguish iPad from Mac.
   if (w.webkit?.messageHandlers) {
+    // navigator.maxTouchPoints > 1 is true on iPad/iPhone but 0 on macOS
+    if (navigator.maxTouchPoints > 1) {
+      return true;
+    }
+    // Fallback: check user-agent for iPhone/iPod (these don't fake desktop UA)
     const ua = navigator.userAgent.toLowerCase();
-    if (ua.includes("iphone") || ua.includes("ipad") || ua.includes("ipod")) {
+    if (ua.includes("iphone") || ua.includes("ipod")) {
       return true;
     }
   }
