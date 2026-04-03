@@ -36,21 +36,16 @@ pub struct ListenConfig {
 }
 
 /// Recognition state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecognitionState {
     /// Not currently listening
+    #[default]
     Idle,
     /// Actively listening for speech
     Listening,
     /// Processing audio (may briefly occur between utterances)
     Processing,
-}
-
-impl Default for RecognitionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// A speech recognition result
@@ -142,10 +137,11 @@ pub struct SupportedLanguagesResponse {
 }
 
 /// Unified error codes for cross-platform consistency
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SttErrorCode {
     /// No error
+    #[default]
     None,
     /// Speech recognition service not available
     NotAvailable,
@@ -173,12 +169,6 @@ pub enum SttErrorCode {
     Busy,
     /// Unknown error
     Unknown,
-}
-
-impl Default for SttErrorCode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl SttErrorCode {
