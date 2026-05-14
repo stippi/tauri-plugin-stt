@@ -15,8 +15,11 @@ pub(crate) async fn start_listening<R: Runtime>(
 
 /// Stop listening for speech
 #[command]
-pub(crate) async fn stop_listening<R: Runtime>(app: AppHandle<R>) -> Result<()> {
-    app.stt().stop_listening()
+pub(crate) async fn stop_listening<R: Runtime>(
+    app: AppHandle<R>,
+    config: Option<StopListeningConfig>,
+) -> Result<Option<RecognitionResult>> {
+    app.stt().stop_listening(config.unwrap_or_default())
 }
 
 /// Check if STT is available on this device

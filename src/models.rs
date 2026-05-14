@@ -35,6 +35,25 @@ pub struct ListenConfig {
     pub on_device: bool,
 }
 
+/// Configuration for gracefully stopping speech recognition.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopListeningConfig {
+    /// Additional microphone audio to accept after the caller requested stop.
+    ///
+    /// This is useful for push-to-talk UX where users release the button right
+    /// after speaking. A short post-roll prevents clipping the final syllables.
+    #[serde(default, rename = "postRollMs")]
+    pub post_roll_ms: u32,
+
+    /// Maximum time to wait for platform recognizers to emit a final result.
+    ///
+    /// Desktop Vosk finalizes synchronously and does not need this timeout, but
+    /// mobile recognizers often report final results asynchronously.
+    #[serde(default, rename = "finalizeTimeoutMs")]
+    pub finalize_timeout_ms: u32,
+}
+
 /// Recognition state
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -252,6 +271,24 @@ mod tests {
         assert!(config.interim_results);
         assert!(config.continuous);
         assert_eq!(config.max_duration, 30);
+    }
+
+    #[test]
+    fn test_stop_listening_config_defaults() {
+        let config: StopListeningConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.post_roll_ms, 0);
+        assert_eq!(config.finalize_timeout_ms, 0);
+    }
+
+    #[test]
+    fn test_stop_listening_config_full() {
+        let json = r#"{
+            "postRollMs": 500,
+            "finalizeTimeoutMs": 2000
+        }"#;
+        let config: StopListeningConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.post_roll_ms, 500);
+        assert_eq!(config.finalize_timeout_ms, 2000);
     }
 
     #[test]

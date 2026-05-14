@@ -25,6 +25,20 @@ struct ListenConfig: Decodable {
     }
 }
 
+struct StopListeningConfig: Decodable {
+    let postRollMs: Int?
+    let finalizeTimeoutMs: Int?
+
+    static var `default`: StopListeningConfig {
+        return StopListeningConfig(postRollMs: 0, finalizeTimeoutMs: 2000)
+    }
+
+    init(postRollMs: Int? = 0, finalizeTimeoutMs: Int? = 2000) {
+        self.postRollMs = postRollMs
+        self.finalizeTimeoutMs = finalizeTimeoutMs
+    }
+}
+
 /// Tauri plugin for Speech-to-Text recognition on iOS
 /// Uses Apple's Speech framework (SFSpeechRecognizer)
 ///
@@ -50,6 +64,10 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
     private var tapInstalled = false     // tracks whether audio tap is installed
     private var wasListeningBeforeInterruption = false
     private var maxDurationTimer: DispatchWorkItem?
+    private var pendingStopInvoke: Invoke?
+    private var stopTimeoutTimer: DispatchWorkItem?
+    private var lastHypothesisResult: JSObject?
+    private var lastFinalResult: JSObject?
 
     override init() {
         super.init()
@@ -82,6 +100,27 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
             "source": "ios-stt",
             "message": message
         ] as JSObject)
+    }
+
+    private func resolveInvoke(_ invoke: Invoke, with data: JSObject?) {
+        DispatchQueue.main.async {
+            if let data = data {
+                invoke.resolve(data)
+            } else {
+                invoke.resolve()
+            }
+        }
+    }
+
+    private func resolvePendingStop(with data: JSObject?) {
+        guard let invoke = pendingStopInvoke else {
+            return
+        }
+
+        pendingStopInvoke = nil
+        stopTimeoutTimer?.cancel()
+        stopTimeoutTimer = nil
+        resolveInvoke(invoke, with: data)
     }
 
     // MARK: - Audio Session Interruption Handling
@@ -187,6 +226,9 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
         if let conf = confidence {
             eventData["confidence"] = conf
         }
+        pluginQueue.async { [weak self] in
+            self?.lastHypothesisResult = eventData
+        }
         emitEvent("result", data: eventData)
     }
 
@@ -201,6 +243,11 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
         ]
         if let conf = confidence {
             eventData["confidence"] = conf
+        }
+        pluginQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lastFinalResult = eventData
+            self.resolvePendingStop(with: eventData)
         }
         emitEvent("result", data: eventData)
         emitEvent("stateChange", data: ["state": "idle"] as JSObject)
@@ -230,9 +277,15 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
                 ] as JSObject)
             }
 
+            if self.isManualStop {
+                self.resolvePendingStop(with: self.lastFinalResult ?? self.lastHypothesisResult)
+                self.cleanupRecognitionAfterStop(cancelTask: false)
+                return
+            }
+
             // If stopRecognition() already ran (manual stop or reentrant),
             // don't call it again — resources are already cleaned up.
-            if self.isManualStop || self.isStopping {
+            if self.isStopping {
                 return
             }
 
@@ -373,11 +426,18 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
 
     @objc public func stopListening(_ invoke: Invoke) throws {
         NSLog("[SttPlugin] stopListening called")
+        let args: StopListeningConfig
+        do {
+            args = try invoke.parseArgs(StopListeningConfig.self)
+        } catch {
+            NSLog("[SttPlugin] Failed to parse stop args, using defaults: \(error)")
+            args = StopListeningConfig.default
+        }
+
         isManualStop = true
         pluginQueue.async { [weak self] in
-            self?.stopRecognitionInternal()
+            self?.stopRecognitionGracefully(config: args, invoke: invoke)
         }
-        invoke.resolve()
     }
 
     @objc public func isAvailable(_ invoke: Invoke) throws {
@@ -480,6 +540,11 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
         // Reset all flags when starting new recognition
         isManualStop = false
         isStopping = false
+        pendingStopInvoke = nil
+        stopTimeoutTimer?.cancel()
+        stopTimeoutTimer = nil
+        lastHypothesisResult = nil
+        lastFinalResult = nil
 
         recognitionTask?.cancel()
         recognitionTask = nil
@@ -625,6 +690,84 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
         // Note: isManualStop and isStopping are NOT reset here.
         // Delegate callbacks may fire asynchronously after cancel().
         // Both flags are reset at the start of next startRecognition().
+
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            } catch {
+                NSLog("[SttPlugin] Failed to deactivate audio session: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func stopRecognitionGracefully(config: StopListeningConfig, invoke: Invoke) {
+        if pendingStopInvoke != nil {
+            invoke.reject("Stop already in progress")
+            return
+        }
+
+        guard isListening || recognitionTask != nil else {
+            resolveInvoke(invoke, with: nil)
+            return
+        }
+
+        pendingStopInvoke = invoke
+        maxDurationTimer?.cancel()
+        maxDurationTimer = nil
+
+        let postRollMs = max(0, config.postRollMs ?? 0)
+        let finalizeTimeoutMs = max(1, config.finalizeTimeoutMs ?? 2000)
+
+        let finishAudio = { [weak self] in
+            guard let self = self else { return }
+            self.finishAudioForGracefulStop(finalizeTimeoutMs: finalizeTimeoutMs)
+        }
+
+        if postRollMs > 0 {
+            pluginQueue.asyncAfter(deadline: .now() + .milliseconds(postRollMs), execute: finishAudio)
+        } else {
+            finishAudio()
+        }
+    }
+
+    private func finishAudioForGracefulStop(finalizeTimeoutMs: Int) {
+        guard pendingStopInvoke != nil else {
+            return
+        }
+
+        maxDurationTimer?.cancel()
+        maxDurationTimer = nil
+
+        if let engine = audioEngine {
+            engine.stop()
+            if tapInstalled {
+                engine.inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
+        }
+
+        isListening = false
+        currentConfig = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self = self, self.pendingStopInvoke != nil else { return }
+            NSLog("[SttPlugin] graceful stop timed out; cancelling recognition task")
+            self.resolvePendingStop(with: self.lastFinalResult ?? self.lastHypothesisResult)
+            self.cleanupRecognitionAfterStop(cancelTask: true)
+            self.emitEvent("stateChange", data: ["state": "idle"] as JSObject)
+        }
+        stopTimeoutTimer = timeout
+        pluginQueue.asyncAfter(deadline: .now() + .milliseconds(finalizeTimeoutMs), execute: timeout)
+    }
+
+    private func cleanupRecognitionAfterStop(cancelTask: Bool) {
+        if cancelTask {
+            recognitionTask?.cancel()
+        }
+        recognitionTask = nil
+        currentConfig = nil
 
         DispatchQueue.global(qos: .utility).async {
             do {

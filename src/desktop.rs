@@ -448,9 +448,9 @@ impl<R: Runtime> Stt<R> {
                 .default_input_device()
                 .ok_or_else(|| crate::Error::Recording("No input device available".to_string()))?;
 
-            let stream_config = device
-                .default_input_config()
-                .map_err(|e| crate::Error::Recording(format!("Failed to get input config: {}", e)))?;
+            let stream_config = device.default_input_config().map_err(|e| {
+                crate::Error::Recording(format!("Failed to get input config: {}", e))
+            })?;
 
             let channels = stream_config.channels() as usize;
             let sample_format = stream_config.sample_format();
@@ -458,8 +458,9 @@ impl<R: Runtime> Stt<R> {
 
             // Vosk expects 16kHz
             let target_sample_rate = 16000.0;
-            let mut recognizer = Recognizer::new(&model, target_sample_rate)
-                .ok_or_else(|| crate::Error::Recording("Failed to create recognizer".to_string()))?;
+            let mut recognizer = Recognizer::new(&model, target_sample_rate).ok_or_else(|| {
+                crate::Error::Recording("Failed to create recognizer".to_string())
+            })?;
 
             recognizer.set_max_alternatives(config.max_alternatives.unwrap_or(1) as u16);
             recognizer.set_partial_words(interim_results);
@@ -601,8 +602,8 @@ impl<R: Runtime> Stt<R> {
                         } else {
                             data.chunks(channels)
                                 .map(|frame| {
-                                    let avg =
-                                        frame.iter().map(|&s| s as i32).sum::<i32>() / channels as i32;
+                                    let avg = frame.iter().map(|&s| s as i32).sum::<i32>()
+                                        / channels as i32;
                                     (avg - 32768) as i16
                                 })
                                 .collect()
@@ -647,7 +648,8 @@ impl<R: Runtime> Stt<R> {
                 let target_sample_rate = 16000.0;
                 if let Some(ref model) = state.model {
                     if let Some(mut new_recognizer) = Recognizer::new(model, target_sample_rate) {
-                        new_recognizer.set_max_alternatives(config.max_alternatives.unwrap_or(1) as u16);
+                        new_recognizer
+                            .set_max_alternatives(config.max_alternatives.unwrap_or(1) as u16);
                         new_recognizer.set_partial_words(interim_results);
                         proc.recognizer = new_recognizer;
                     }
@@ -710,11 +712,18 @@ impl<R: Runtime> Stt<R> {
         Ok(())
     }
 
-    pub fn stop_listening(&self) -> crate::Result<()> {
+    pub fn stop_listening(
+        &self,
+        config: StopListeningConfig,
+    ) -> crate::Result<Option<RecognitionResult>> {
+        if config.post_roll_ms > 0 {
+            std::thread::sleep(Duration::from_millis(config.post_roll_ms as u64));
+        }
+
         let mut state = self.state.lock().unwrap();
 
         if !state.is_listening {
-            return Ok(());
+            return Ok(None);
         }
 
         let final_result = state.audio_processor.as_ref().and_then(|processor| {
@@ -772,7 +781,7 @@ impl<R: Runtime> Stt<R> {
             },
         );
 
-        Ok(())
+        Ok(final_result)
     }
 
     pub fn is_available(&self) -> crate::Result<AvailabilityResponse> {

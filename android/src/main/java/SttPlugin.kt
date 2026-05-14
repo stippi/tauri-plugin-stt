@@ -31,6 +31,12 @@ class ListenConfig {
     var maxDuration: Int = 0
 }
 
+@InvokeArg
+class StopListeningConfig {
+    var postRollMs: Int = 0
+    var finalizeTimeoutMs: Int = 2000
+}
+
 @TauriPlugin(
     permissions = [
         Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone")
@@ -51,6 +57,10 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
     // maxDuration handling
     private var maxDurationHandler: Handler? = null
     private var maxDurationRunnable: Runnable? = null
+    private var pendingStopInvoke: Invoke? = null
+    private var stopFinalizeRunnable: Runnable? = null
+    private var lastPartialResult: JSObject? = null
+    private var lastFinalResult: JSObject? = null
     
     // Continuous mode restart handling
     private var consecutiveErrors = 0
@@ -101,6 +111,9 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         // Cancel restart handler
         restartHandler.removeCallbacksAndMessages(null)
         Log.d(TAG, "  Restart handler cancelled")
+        stopFinalizeRunnable?.let { restartHandler.removeCallbacks(it) }
+        stopFinalizeRunnable = null
+        pendingStopInvoke = null
 
         permissionPollRunnable?.let { permissionRequestHandler.removeCallbacks(it) }
         permissionPollRunnable = null
@@ -184,6 +197,8 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
                 
                 val intent = createRecognizerIntent(config)
                 currentLanguage = config.language ?: Locale.getDefault().toLanguageTag()
+                lastPartialResult = null
+                lastFinalResult = null
                 Log.d(TAG, "Starting speech recognition:")
                 Log.d(TAG, "  - Package: ${activity.packageName}")
                 Log.d(TAG, "  - Language: $currentLanguage")
@@ -231,6 +246,17 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
                         consecutiveErrors++
                         
                         Log.e(TAG, "Speech recognition error: $errorMessage (code: $error) [consecutive: $consecutiveErrors]")
+
+                        if (pendingStopInvoke != null) {
+                            Log.w(TAG, "Recognition error while finalizing stop; resolving with best partial result")
+                            isListening = false
+                            resolvePendingStop(lastFinalResult ?: lastPartialResult)
+
+                            val stateEvent = JSObject()
+                            stateEvent.put("state", "idle")
+                            trigger("stateChange", stateEvent)
+                            return
+                        }
                         
                         // Log additional details for ERROR_NO_MATCH
                         if (error == SpeechRecognizer.ERROR_NO_MATCH) {
@@ -287,7 +313,7 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
 
                     override fun onResults(results: Bundle?) {
                         // Save continuous state before setting isListening to false
-                        val shouldContinue = config.continuous && isListening
+                        val shouldContinue = config.continuous && isListening && pendingStopInvoke == null
                         isListening = false
                         
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -305,7 +331,13 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
                             if (confidences != null && confidences.isNotEmpty()) {
                                 event.put("confidence", confidences[0].toDouble())
                             }
+                            lastFinalResult = event
                             trigger("result", event)
+                            resolvePendingStop(event)
+                        }
+
+                        if (pendingStopInvoke != null) {
+                            resolvePendingStop(lastFinalResult ?: lastPartialResult)
                         }
 
                         // Restart listening if in continuous mode
@@ -334,6 +366,7 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
                                 val event = JSObject()
                                 event.put("transcript", matches[0])
                                 event.put("isFinal", false)
+                                lastPartialResult = event
                                 trigger("result", event)
                             }
                         }
@@ -383,6 +416,17 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         Log.i(TAG, "stopListening() CALLED")
         Log.d(TAG, "  isListening: $isListening")
         Log.d(TAG, "  consecutiveErrors: $consecutiveErrors")
+        val config = invoke.parseArgs(StopListeningConfig::class.java)
+
+        if (pendingStopInvoke != null) {
+            invoke.reject("Stop already in progress")
+            return
+        }
+
+        if (!isListening) {
+            invoke.resolve()
+            return
+        }
         
         // Cancel max duration timer
         maxDurationRunnable?.let { maxDurationHandler?.removeCallbacks(it) }
@@ -394,21 +438,36 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
         restartHandler.removeCallbacksAndMessages(null)
         consecutiveErrors = 0
         Log.d(TAG, "  Restart handler cancelled, errors reset")
+        pendingStopInvoke = invoke
         
         activity.runOnUiThread {
             try {
-                Log.d(TAG, "  Stopping on UI thread...")
-                speechRecognizer?.stopListening()
-                speechRecognizer?.cancel()
-                isListening = false
-                Log.d(TAG, "  SpeechRecognizer stopped and cancelled")
+                val stopAction = Runnable {
+                    Log.d(TAG, "  Gracefully stopping on UI thread...")
+                    speechRecognizer?.stopListening()
 
-                val event = JSObject()
-                event.put("state", "idle")
-                trigger("stateChange", event)
-                
-                invoke.resolve()
+                    val timeoutMs = maxOf(1, config.finalizeTimeoutMs).toLong()
+                    stopFinalizeRunnable = Runnable {
+                        Log.w(TAG, "  Final recognition result timed out; cancelling")
+                        speechRecognizer?.cancel()
+                        isListening = false
+                        resolvePendingStop(lastFinalResult ?: lastPartialResult)
+
+                        val event = JSObject()
+                        event.put("state", "idle")
+                        trigger("stateChange", event)
+                    }
+                    restartHandler.postDelayed(stopFinalizeRunnable!!, timeoutMs)
+                }
+
+                val postRollMs = maxOf(0, config.postRollMs).toLong()
+                if (postRollMs > 0) {
+                    restartHandler.postDelayed(stopAction, postRollMs)
+                } else {
+                    stopAction.run()
+                }
             } catch (e: Exception) {
+                pendingStopInvoke = null
                 invoke.reject("Failed to stop listening: ${e.message}")
             }
         }
@@ -582,6 +641,20 @@ class SttPlugin(private val activity: Activity) : Plugin(activity) {
 
         pendingPermissionInvoke = null
         permissionRequestDeadlineMs = 0L
+    }
+
+    private fun resolvePendingStop(result: JSObject?) {
+        stopFinalizeRunnable?.let { restartHandler.removeCallbacks(it) }
+        stopFinalizeRunnable = null
+
+        val invoke = pendingStopInvoke ?: return
+        pendingStopInvoke = null
+
+        if (result != null) {
+            invoke.resolve(result)
+        } else {
+            invoke.resolve()
+        }
     }
 
     private fun createRecognizerIntent(config: ListenConfig): Intent {

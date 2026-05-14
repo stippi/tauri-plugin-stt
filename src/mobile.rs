@@ -33,9 +33,12 @@ impl<R: Runtime> Stt<R> {
     }
 
     /// Stop listening for speech
-    pub fn stop_listening(&self) -> crate::Result<()> {
+    pub fn stop_listening(
+        &self,
+        config: StopListeningConfig,
+    ) -> crate::Result<Option<RecognitionResult>> {
         self.0
-            .run_mobile_plugin::<()>("stopListening", ())
+            .run_mobile_plugin("stopListening", config)
             .map_err(Into::into)
     }
 

@@ -21,6 +21,19 @@ export interface ListenConfig {
   onDevice?: boolean;
 }
 
+export interface StopListeningConfig {
+  /**
+   * Additional microphone audio to accept after stop was requested.
+   * Useful for push-to-talk so the final syllables are not clipped.
+   */
+  postRollMs?: number;
+  /**
+   * Maximum time mobile platform recognizers may wait for a final result.
+   * Desktop Vosk finalizes synchronously.
+   */
+  finalizeTimeoutMs?: number;
+}
+
 export type RecognitionState = "idle" | "listening" | "processing";
 
 export interface RecognitionResult {
@@ -98,8 +111,12 @@ export async function startListening(config?: ListenConfig): Promise<void> {
   await invoke("plugin:stt|start_listening", { config: config || {} });
 }
 
-export async function stopListening(): Promise<void> {
-  await invoke("plugin:stt|stop_listening");
+export async function stopListening(
+  config?: StopListeningConfig
+): Promise<RecognitionResult | null> {
+  return await invoke<RecognitionResult | null>("plugin:stt|stop_listening", {
+    config: config || {},
+  });
 }
 
 export async function isAvailable(): Promise<AvailabilityResponse> {
