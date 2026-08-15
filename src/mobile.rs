@@ -24,6 +24,12 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 /// Access to the STT APIs.
 pub struct Stt<R: Runtime>(PluginHandle<R>);
 
+impl<R: Runtime> Clone for Stt<R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl<R: Runtime> Stt<R> {
     /// Start listening for speech
     pub fn start_listening(&self, config: ListenConfig) -> crate::Result<()> {

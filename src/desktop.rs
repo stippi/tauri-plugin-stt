@@ -128,6 +128,15 @@ pub struct Stt<R: Runtime> {
     state: Arc<Mutex<SttState>>,
 }
 
+impl<R: Runtime> Clone for Stt<R> {
+    fn clone(&self) -> Self {
+        Self {
+            app: self.app.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
 impl<R: Runtime> Stt<R> {
     fn complete_result_text(result: vosk::CompleteResult) -> String {
         match result {
@@ -145,7 +154,7 @@ impl<R: Runtime> Stt<R> {
         let _ = self.app.emit("plugin:stt:result", result);
     }
 
-    fn get_models_dir(&self) -> PathBuf {
+    pub(crate) fn get_models_dir(&self) -> PathBuf {
         self.app
             .path()
             .app_data_dir()
@@ -153,7 +162,7 @@ impl<R: Runtime> Stt<R> {
             .join("vosk-models")
     }
 
-    fn get_model_info_for_language(&self, language: &str) -> Option<(&'static str, &'static str)> {
+    pub(crate) fn get_model_info_for_language(&self, language: &str) -> Option<(&'static str, &'static str)> {
         // First try exact match
         if let Some((_, name, url)) = AVAILABLE_MODELS
             .iter()
@@ -355,7 +364,7 @@ impl<R: Runtime> Stt<R> {
         Ok(model_path)
     }
 
-    fn ensure_model(&self, language: Option<&str>) -> crate::Result<Arc<Model>> {
+    pub(crate) fn ensure_model(&self, language: Option<&str>) -> crate::Result<Arc<Model>> {
         let (model_name, model_url) = if let Some(lang) = language {
             match self.get_model_info_for_language(lang) {
                 Some((name, url)) => (name, url),

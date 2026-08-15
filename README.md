@@ -230,6 +230,40 @@ unlistenState();
 unlistenError();
 ```
 
+## Rust API: buffer-fed recognition (`Recognizer`)
+
+Hosts that already own the microphone (an app with its own Rust audio
+pipeline) don't want the plugin to open a second capture stream and report
+results through the webview. For them the plugin exposes a **buffer-fed**
+recognizer callable from Rust: push PCM in, get hypotheses back on a callback.
+No JS bridge, no `AVAudioEngine` of its own.
+
+```rust
+use tauri_plugin_stt::{Recognizer, RecognizerConfig, RecognizerEvent, SttExt};
+
+let recognizer = app.recognizer(); // SharedRecognizer, cloneable
+let session = recognizer.open(
+    RecognizerConfig { language: "de-DE".into(), sample_rate: 16_000, interim_results: true, on_device: false },
+    Box::new(|event| match event {
+        RecognizerEvent::Partial(text) => { /* live hypothesis */ }
+        RecognizerEvent::Final(text) => { /* committed segment */ }
+        RecognizerEvent::Error(msg) => { /* … */ }
+        RecognizerEvent::Ended => { /* no more events */ }
+    }),
+)?;
+session.feed(&pcm_i16_mono);   // as often as you like
+session.finish();              // → Final (if any) + Ended on the callback
+```
+
+| Platform | Binding | Notes |
+| -------- | ------- | ----- |
+| iOS | `SFSpeechAudioBufferRecognitionRequest` over a C ABI (`ios/Sources/SttStream.swift` ↔ `src/ios_stream.rs`) | `open` prompts for speech-recognition authorization if undetermined (blocking; call off the main thread). Feed mono Int16 at the configured rate. |
+| macOS / Windows / Linux | In-process Vosk over the plugin's model store | `open` downloads the language's model on first use (progress as `stt://download-progress`); use `status()` / `install_model()` to do that ahead of time. |
+| Android | Not implemented | `status().available` is `false`; `open` errors. |
+
+`Recognizer::open`, `install_model` and `request_authorization` block — call
+them from a blocking-capable thread (`spawn_blocking`).
+
 ## Events
 
 | Event                     | Payload                                | Description                              |
