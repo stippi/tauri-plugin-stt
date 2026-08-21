@@ -1,70 +1,175 @@
 use serde::de::DeserializeOwned;
-use std::fs::{self, File};
-use std::io::{self, Cursor};
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{plugin::PluginApi, AppHandle, Emitter, Manager, Runtime};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use md5::{Digest, Md5};
 use vosk::{Model, Recognizer};
 
 use crate::models::*;
 
-/// Default Vosk model configuration
-const DEFAULT_MODEL_NAME: &str = "vosk-model-en-us-0.42-gigaspeech";
-const DEFAULT_MODEL_URL: &str =
-    "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip";
+/// A downloadable Vosk model.
+///
+/// `md5` and `size` are the values alphacephei.com publishes for the archive in
+/// `model-list.json`. They are pinned here on purpose: they let us tell a
+/// finished download from a truncated one *before* anything is unpacked, and
+/// they detect a swapped or corrupted archive.
+pub(crate) struct ModelSpec {
+    lang: &'static str,
+    name: &'static str,
+    url: &'static str,
+    /// MD5 of the .zip archive, as published upstream.
+    md5: &'static str,
+    /// Size of the .zip archive in bytes, as published upstream.
+    size: u64,
+}
+
+impl ModelSpec {
+    /// True if this model is completely installed under `models_dir`.
+    pub(crate) fn is_installed_in(&self, models_dir: &Path) -> bool {
+        model_is_complete(&models_dir.join(self.name), self.md5)
+    }
+}
+
+/// Written inside a model directory once its archive was fully downloaded,
+/// checksum-verified and extracted. The file holds the verified MD5, so an
+/// interrupted install leaves no marker and is never mistaken for a usable
+/// model. This is the ONLY thing that makes a model count as installed.
+const MARKER_FILE: &str = ".verified-md5";
+
+/// Holds partial downloads and extraction staging, next to the models.
+const STAGING_SUBDIR: &str = ".incomplete";
+
+/// Percentage the download itself accounts for; checksum and extraction fill
+/// the rest so the UI keeps moving through all three phases.
+const DOWNLOAD_PROGRESS_SHARE: u8 = 45;
+const EXTRACT_PROGRESS_START: u8 = 50;
 
 /// Available Vosk models with their download URLs
 /// Using high-accuracy models for better transcription quality
-const AVAILABLE_MODELS: &[(&str, &str, &str)] = &[
-    (
-        "en-US",
-        "vosk-model-en-us-0.42-gigaspeech",
-        "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip",
-    ),
-    (
-        "pt-BR",
-        "vosk-model-pt-fb-v0.1.1-20220516_2113",
-        "https://alphacephei.com/vosk/models/vosk-model-pt-fb-v0.1.1-20220516_2113.zip",
-    ),
-    (
-        "es-ES",
-        "vosk-model-es-0.42",
-        "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip",
-    ),
-    (
-        "fr-FR",
-        "vosk-model-fr-0.22",
-        "https://alphacephei.com/vosk/models/vosk-model-fr-0.22.zip",
-    ),
-    (
-        "de-DE",
-        "vosk-model-de-0.21",
-        "https://alphacephei.com/vosk/models/vosk-model-de-0.21.zip",
-    ),
-    (
-        "ru-RU",
-        "vosk-model-ru-0.42",
-        "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
-    ),
-    (
-        "zh-CN",
-        "vosk-model-cn-0.22",
-        "https://alphacephei.com/vosk/models/vosk-model-cn-0.22.zip",
-    ),
-    (
-        "ja-JP",
-        "vosk-model-ja-0.22",
-        "https://alphacephei.com/vosk/models/vosk-model-ja-0.22.zip",
-    ),
-    (
-        "it-IT",
-        "vosk-model-it-0.22",
-        "https://alphacephei.com/vosk/models/vosk-model-it-0.22.zip",
-    ),
+const AVAILABLE_MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        lang: "en-US",
+        name: "vosk-model-en-us-0.42-gigaspeech",
+        url: "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip",
+        md5: "db1202c15b40ea4b1ec27b85a90dffbe",
+        size: 2_423_807_363,
+    },
+    ModelSpec {
+        lang: "pt-BR",
+        name: "vosk-model-pt-fb-v0.1.1-20220516_2113",
+        url: "https://alphacephei.com/vosk/models/vosk-model-pt-fb-v0.1.1-20220516_2113.zip",
+        md5: "5d259cb674fd52a61c97c1e53282d4b3",
+        size: 1_693_530_883,
+    },
+    ModelSpec {
+        lang: "es-ES",
+        name: "vosk-model-es-0.42",
+        url: "https://alphacephei.com/vosk/models/vosk-model-es-0.42.zip",
+        md5: "83f83e045a4537c53ed5ed42f959bf6d",
+        size: 1_484_681_703,
+    },
+    ModelSpec {
+        lang: "fr-FR",
+        name: "vosk-model-fr-0.22",
+        url: "https://alphacephei.com/vosk/models/vosk-model-fr-0.22.zip",
+        md5: "12662b25b4d35059ec05e3a75a27841e",
+        size: 1_523_026_348,
+    },
+    ModelSpec {
+        lang: "de-DE",
+        name: "vosk-model-de-0.21",
+        url: "https://alphacephei.com/vosk/models/vosk-model-de-0.21.zip",
+        md5: "23298ddeb602739016956144ac4c74de",
+        size: 2_031_717_803,
+    },
+    ModelSpec {
+        lang: "ru-RU",
+        name: "vosk-model-ru-0.42",
+        url: "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
+        md5: "ae356c0fc8879deed1982d879f40880a",
+        size: 1_937_602_113,
+    },
+    ModelSpec {
+        lang: "zh-CN",
+        name: "vosk-model-cn-0.22",
+        url: "https://alphacephei.com/vosk/models/vosk-model-cn-0.22.zip",
+        md5: "c050f6849398ceecfa723cca69b8c67d",
+        size: 1_358_736_686,
+    },
+    ModelSpec {
+        lang: "ja-JP",
+        name: "vosk-model-ja-0.22",
+        url: "https://alphacephei.com/vosk/models/vosk-model-ja-0.22.zip",
+        md5: "e7ab21ff213aff2edf1f04724487846c",
+        size: 1_045_975_323,
+    },
+    ModelSpec {
+        lang: "it-IT",
+        name: "vosk-model-it-0.22",
+        url: "https://alphacephei.com/vosk/models/vosk-model-it-0.22.zip",
+        md5: "973cf0adc17ea0acd042d079bba67a94",
+        size: 1_306_765_292,
+    },
 ];
+
+/// The model used when a language has no entry of its own.
+const DEFAULT_MODEL: &ModelSpec = &AVAILABLE_MODELS[0];
+
+/// True if `model_path` holds a completely installed model for `expected_md5`.
+pub(crate) fn model_is_complete(model_path: &Path, expected_md5: &str) -> bool {
+    fs::read_to_string(model_path.join(MARKER_FILE))
+        .map(|recorded| recorded.trim().eq_ignore_ascii_case(expected_md5))
+        .unwrap_or(false)
+}
+
+/// Streams `path` through MD5 without holding it in memory.
+fn md5_of_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Finds the model directory inside a freshly extracted archive. Vosk archives
+/// carry a single top-level directory named after the model.
+fn locate_model_root(extract_dir: &Path, model_name: &str) -> crate::Result<PathBuf> {
+    let direct = extract_dir.join(model_name);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+
+    let mut dirs: Vec<PathBuf> = fs::read_dir(extract_dir)
+        .map_err(|e| crate::Error::Recording(format!("Failed to read extracted archive: {}", e)))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+
+    match dirs.len() {
+        1 => Ok(dirs.remove(0)),
+        // No directory at all: the archive put the model files at its root.
+        0 => Ok(extract_dir.to_path_buf()),
+        _ => Err(crate::Error::Recording(format!(
+            "Archive for '{}' has an unexpected layout ({} top-level directories)",
+            model_name,
+            dirs.len()
+        ))),
+    }
+}
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -162,72 +267,96 @@ impl<R: Runtime> Stt<R> {
             .join("vosk-models")
     }
 
-    pub(crate) fn get_model_info_for_language(&self, language: &str) -> Option<(&'static str, &'static str)> {
+    pub(crate) fn get_model_info_for_language(&self, language: &str) -> Option<&'static ModelSpec> {
         // First try exact match
-        if let Some((_, name, url)) = AVAILABLE_MODELS
-            .iter()
-            .find(|(lang, _, _)| *lang == language)
-        {
-            return Some((*name, *url));
+        if let Some(spec) = AVAILABLE_MODELS.iter().find(|spec| spec.lang == language) {
+            return Some(spec);
         }
 
         // If not found, try to match by language prefix (e.g., "pt" matches "pt-BR")
         if let Some(prefix) = language.split('-').next() {
-            if let Some((_, name, url)) = AVAILABLE_MODELS
+            if let Some(spec) = AVAILABLE_MODELS
                 .iter()
-                .find(|(lang, _, _)| lang.split('-').next() == Some(prefix))
+                .find(|spec| spec.lang.split('-').next() == Some(prefix))
             {
-                return Some((*name, *url));
+                return Some(spec);
             }
         }
 
         None
     }
 
-    /// Download and extract a Vosk model in a separate thread to avoid tokio conflicts
-    fn download_model(&self, model_name: &str, url: &str) -> crate::Result<PathBuf> {
-        let models_dir = self.get_models_dir();
-        fs::create_dir_all(&models_dir).map_err(|e| {
-            crate::Error::Recording(format!("Failed to create models directory: {}", e))
-        })?;
-
-        let model_path = models_dir.join(model_name);
-
-        // If already exists, return path
-        if model_path.exists() {
-            return Ok(model_path);
-        }
-
-        println!("Downloading model '{}' from {}", model_name, url);
-
-        // Emit download start event
+    fn emit_progress(&self, status: &str, model: &str, progress: u8) {
         let _ = self.app.emit(
             "stt://download-progress",
             serde_json::json!({
-                "status": "downloading",
-                "model": model_name,
-                "progress": 0
+                "status": status,
+                "model": model,
+                "progress": progress
             }),
         );
+    }
 
-        // Download in a separate thread to avoid tokio runtime conflicts
-        let url_owned = url.to_string();
-        let model_name_owned = model_name.to_string();
+    /// Fetches the archive into `archive_path`, resuming a partial file if one
+    /// is there. Runs the blocking HTTP in its own thread to avoid tokio
+    /// runtime conflicts.
+    fn fetch_archive(&self, spec: &'static ModelSpec, archive_path: &Path) -> crate::Result<()> {
+        let mut have = fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+
+        if have > spec.size {
+            // Longer than the real archive: not a prefix of it, so nothing to resume.
+            println!(
+                "Discarding oversized partial download for '{}' ({} > {} bytes)",
+                spec.name, have, spec.size
+            );
+            fs::remove_file(archive_path).ok();
+            have = 0;
+        }
+
+        if have == spec.size {
+            println!("Archive for '{}' already complete, skipping download", spec.name);
+            return Ok(());
+        }
+
+        if have > 0 {
+            println!(
+                "Resuming download of '{}' at {:.2} / {:.2} MB",
+                spec.name,
+                have as f64 / 1_048_576.0,
+                spec.size as f64 / 1_048_576.0
+            );
+        } else {
+            println!("Downloading model '{}' from {}", spec.name, spec.url);
+        }
+
+        self.emit_progress(
+            "downloading",
+            spec.name,
+            ((have as f64 / spec.size as f64) * DOWNLOAD_PROGRESS_SHARE as f64) as u8,
+        );
+
         let app_handle = self.app.clone();
+        let target = archive_path.to_path_buf();
 
-        let handle = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        let handle = std::thread::spawn(move || -> Result<(), String> {
             let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(3000)) // Timeout total de 3000s
+                .connect_timeout(Duration::from_secs(30))
+                // No overall timeout: these archives are gigabytes, and an
+                // interrupted transfer resumes on the next attempt anyway.
+                .timeout(None)
                 .build()
                 .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-            let response = client
-                .get(&url_owned)
+            let mut request = client.get(spec.url);
+            if have > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={}-", have));
+            }
+
+            let response = request
                 .send()
-                .map_err(|e| format!("Failed to download model from {}: {}", url_owned, e))?;
+                .map_err(|e| format!("Failed to download model from {}: {}", spec.url, e))?;
 
             let status = response.status();
-
             if !status.is_success() {
                 return Err(format!(
                     "Failed to download model: HTTP {} - {}",
@@ -238,99 +367,200 @@ impl<R: Runtime> Stt<R> {
                 ));
             }
 
-            // Get content length if available
-            let total_size = response.content_length();
+            // A server that ignores Range answers 200 with the whole file — then
+            // the partial file has to go, or we would splice two copies together.
+            let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+            if have > 0 && !resuming {
+                println!("Server ignored the range request, restarting from zero");
+            }
 
-            // Read bytes in chunks with progress tracking
-            use std::io::Read;
+            let file = if resuming {
+                OpenOptions::new()
+                    .append(true)
+                    .open(&target)
+                    .map_err(|e| format!("Failed to open partial download: {}", e))?
+            } else {
+                File::create(&target)
+                    .map_err(|e| format!("Failed to create download file: {}", e))?
+            };
+            let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
             let mut reader = response;
-            let mut buffer = Vec::new();
-            let mut downloaded: usize = 0;
-            let chunk_size = 64 * 1024; // 64KB chunks for better performance
-            let mut chunk = vec![0u8; chunk_size];
-            let mut last_progress_mb = 0;
+            let mut written: u64 = if resuming { have } else { 0 };
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut last_progress_mb = written / (5 * 1024 * 1024);
 
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        buffer.extend_from_slice(&chunk[..n]);
-                        downloaded += n;
+                        writer
+                            .write_all(&chunk[..n])
+                            .map_err(|e| format!("Failed to write download: {}", e))?;
+                        written += n as u64;
 
-                        // Show progress every 5MB
-                        let current_mb = downloaded / (5 * 1024 * 1024);
+                        // Report progress every 5MB
+                        let current_mb = written / (5 * 1024 * 1024);
                         if current_mb > last_progress_mb {
                             last_progress_mb = current_mb;
+                            print!(
+                                "\rProgress: {:.2} / {:.2} MB   ",
+                                written as f64 / 1_048_576.0,
+                                spec.size as f64 / 1_048_576.0
+                            );
+                            std::io::Write::flush(&mut std::io::stdout()).ok();
 
-                            if let Some(total) = total_size {
-                                let progress = ((downloaded as f64 / total as f64) * 50.0) as u8;
-                                print!(
-                                    "\rProgress: {:.2} / {:.2} MB   ",
-                                    downloaded as f64 / 1_048_576.0,
-                                    total as f64 / 1_048_576.0
-                                );
-                                std::io::Write::flush(&mut std::io::stdout()).ok();
-
-                                let _ = app_handle.emit(
-                                    "stt://download-progress",
-                                    serde_json::json!({
-                                        "status": "downloading",
-                                        "model": model_name_owned,
-                                        "progress": progress
-                                    }),
-                                );
-                            } else {
-                                print!("\rProgress: {:.2} MB   ", downloaded as f64 / 1_048_576.0);
-                                std::io::Write::flush(&mut std::io::stdout()).ok();
-                            }
+                            let progress = ((written as f64 / spec.size as f64)
+                                * DOWNLOAD_PROGRESS_SHARE as f64)
+                                as u8;
+                            let _ = app_handle.emit(
+                                "stt://download-progress",
+                                serde_json::json!({
+                                    "status": "downloading",
+                                    "model": spec.name,
+                                    "progress": progress
+                                }),
+                            );
                         }
                     }
                     Err(e) => {
                         println!(); // New line after progress
+                        writer.flush().ok();
                         return Err(format!("Failed to read chunk: {}", e));
                     }
                 }
             }
 
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush download: {}", e))?;
+
             println!(); // New line after progress bar
-            println!(
-                "Download complete: {:.2} MB",
-                downloaded as f64 / 1_048_576.0
-            );
+            println!("Download complete: {:.2} MB", written as f64 / 1_048_576.0);
 
-            // Emit extraction event
-            let _ = app_handle.emit(
-                "stt://download-progress",
-                serde_json::json!({
-                    "status": "extracting",
-                    "model": model_name_owned,
-                    "progress": 50
-                }),
-            );
+            if written != spec.size {
+                // Kept on disk: the next attempt resumes where this one stopped.
+                return Err(format!(
+                    "Download stopped short: got {} of {} bytes — retry to resume",
+                    written, spec.size
+                ));
+            }
 
-            Ok(buffer)
+            Ok(())
         });
 
-        // Wait for download to complete
-        let bytes = handle
+        handle
             .join()
             .map_err(|_| crate::Error::Recording("Download thread panicked".to_string()))?
             .map_err(crate::Error::Recording)?;
 
-        println!("Extracting model...");
+        Ok(())
+    }
 
-        // Extract the zip (this is fast enough to do on main thread)
-        let cursor = Cursor::new(bytes);
-        let mut archive = zip::ZipArchive::new(cursor)
+    /// Downloads (resuming if possible), verifies and extracts a model.
+    ///
+    /// Nothing lands under the model's own name until the archive matched its
+    /// published MD5 and was fully unpacked — the last step writes the marker
+    /// file that makes the model count as installed.
+    fn download_model(&self, spec: &'static ModelSpec) -> crate::Result<PathBuf> {
+        let models_dir = self.get_models_dir();
+        fs::create_dir_all(&models_dir).map_err(|e| {
+            crate::Error::Recording(format!("Failed to create models directory: {}", e))
+        })?;
+
+        let model_path = models_dir.join(spec.name);
+
+        if model_is_complete(&model_path, spec.md5) {
+            return Ok(model_path);
+        }
+
+        if model_path.exists() {
+            // Left over from an interrupted install (or from before the marker
+            // existed). It may be missing files, so it cannot be trusted.
+            println!(
+                "Discarding unverified model directory {}",
+                model_path.display()
+            );
+            fs::remove_dir_all(&model_path).map_err(|e| {
+                crate::Error::Recording(format!("Failed to remove incomplete model: {}", e))
+            })?;
+        }
+
+        let staging = models_dir.join(STAGING_SUBDIR);
+        fs::create_dir_all(&staging).map_err(|e| {
+            crate::Error::Recording(format!("Failed to create staging directory: {}", e))
+        })?;
+        let archive_path = staging.join(format!("{}.zip.part", spec.name));
+
+        self.fetch_archive(spec, &archive_path)?;
+
+        println!("Verifying checksum...");
+        self.emit_progress("verifying", spec.name, DOWNLOAD_PROGRESS_SHARE);
+        let actual = md5_of_file(&archive_path).map_err(|e| {
+            crate::Error::Recording(format!("Failed to read downloaded archive: {}", e))
+        })?;
+        if !actual.eq_ignore_ascii_case(spec.md5) {
+            // A resumed transfer can only mismatch if the bytes are bad or the
+            // upstream file changed — either way, resuming it further is futile.
+            fs::remove_file(&archive_path).ok();
+            return Err(crate::Error::Recording(format!(
+                "Checksum mismatch for '{}': expected {}, got {}. Archive discarded, please retry.",
+                spec.name, spec.md5, actual
+            )));
+        }
+
+        println!("Extracting model...");
+        self.emit_progress("extracting", spec.name, EXTRACT_PROGRESS_START);
+
+        let extract_dir = staging.join(format!("{}-extract", spec.name));
+        fs::remove_dir_all(&extract_dir).ok();
+        fs::create_dir_all(&extract_dir).map_err(|e| {
+            crate::Error::Recording(format!("Failed to create extraction directory: {}", e))
+        })?;
+
+        self.extract_archive(&archive_path, &extract_dir, spec)?;
+
+        let extracted_root = locate_model_root(&extract_dir, spec.name)?;
+        fs::rename(&extracted_root, &model_path).map_err(|e| {
+            crate::Error::Recording(format!("Failed to move model into place: {}", e))
+        })?;
+
+        // Only now does the model count as installed.
+        fs::write(model_path.join(MARKER_FILE), spec.md5).map_err(|e| {
+            crate::Error::Recording(format!("Failed to write model marker: {}", e))
+        })?;
+
+        fs::remove_file(&archive_path).ok();
+        fs::remove_dir_all(&extract_dir).ok();
+
+        self.emit_progress("complete", spec.name, 100);
+
+        Ok(model_path)
+    }
+
+    /// Unpacks the archive from disk (never held in memory — these are GBs).
+    fn extract_archive(
+        &self,
+        archive_path: &Path,
+        extract_dir: &Path,
+        spec: &ModelSpec,
+    ) -> crate::Result<()> {
+        let file = File::open(archive_path)
+            .map_err(|e| crate::Error::Recording(format!("Failed to open archive: {}", e)))?;
+        let mut archive = zip::ZipArchive::new(BufReader::with_capacity(1024 * 1024, file))
             .map_err(|e| crate::Error::Recording(format!("Failed to open zip: {}", e)))?;
+
+        let total = archive.len().max(1);
+        let mut last_reported = EXTRACT_PROGRESS_START;
 
         for i in 0..archive.len() {
             let mut file = archive
                 .by_index(i)
                 .map_err(|e| crate::Error::Recording(format!("Failed to read zip entry: {}", e)))?;
 
+            // `enclosed_name` rejects paths that would escape the target directory.
             let outpath = match file.enclosed_name() {
-                Some(path) => models_dir.join(path),
+                Some(path) => extract_dir.join(path),
                 None => continue,
             };
 
@@ -342,37 +572,35 @@ impl<R: Runtime> Stt<R> {
                         fs::create_dir_all(p).ok();
                     }
                 }
-                let mut outfile = File::create(&outpath).map_err(|e| {
+                let outfile = File::create(&outpath).map_err(|e| {
                     crate::Error::Recording(format!("Failed to create file: {}", e))
                 })?;
-                io::copy(&mut file, &mut outfile).map_err(|e| {
+                let mut writer = BufWriter::with_capacity(1024 * 1024, outfile);
+                io::copy(&mut file, &mut writer).map_err(|e| {
+                    crate::Error::Recording(format!("Failed to extract file: {}", e))
+                })?;
+                writer.flush().map_err(|e| {
                     crate::Error::Recording(format!("Failed to extract file: {}", e))
                 })?;
             }
+
+            let span = 99 - EXTRACT_PROGRESS_START;
+            let progress =
+                EXTRACT_PROGRESS_START + ((i + 1) as f64 / total as f64 * span as f64) as u8;
+            if progress > last_reported {
+                last_reported = progress;
+                self.emit_progress("extracting", spec.name, progress);
+            }
         }
 
-        // Emit completion event
-        let _ = self.app.emit(
-            "stt://download-progress",
-            serde_json::json!({
-                "status": "complete",
-                "model": model_name,
-                "progress": 100
-            }),
-        );
-
-        Ok(model_path)
+        Ok(())
     }
 
     pub(crate) fn ensure_model(&self, language: Option<&str>) -> crate::Result<Arc<Model>> {
-        let (model_name, model_url) = if let Some(lang) = language {
-            match self.get_model_info_for_language(lang) {
-                Some((name, url)) => (name, url),
-                None => (DEFAULT_MODEL_NAME, DEFAULT_MODEL_URL),
-            }
-        } else {
-            (DEFAULT_MODEL_NAME, DEFAULT_MODEL_URL)
-        };
+        let spec = language
+            .and_then(|lang| self.get_model_info_for_language(lang))
+            .unwrap_or(DEFAULT_MODEL);
+        let model_name = spec.name;
 
         let mut state = self.state.lock().unwrap();
 
@@ -391,7 +619,7 @@ impl<R: Runtime> Stt<R> {
         drop(state);
 
         // Download model if needed
-        let model_path = self.download_model(model_name, model_url)?;
+        let model_path = self.download_model(spec)?;
 
         if !model_path.exists() {
             return Err(crate::Error::NotAvailable(format!(
@@ -810,11 +1038,11 @@ impl<R: Runtime> Stt<R> {
 
         let languages: Vec<SupportedLanguage> = AVAILABLE_MODELS
             .iter()
-            .map(|(code, model_name, _)| {
-                let installed = models_dir.join(model_name).exists();
+            .map(|spec| {
+                let installed = spec.is_installed_in(&models_dir);
                 SupportedLanguage {
-                    code: code.to_string(),
-                    name: get_language_display_name(code),
+                    code: spec.lang.to_string(),
+                    name: get_language_display_name(spec.lang),
                     installed: Some(installed),
                 }
             })

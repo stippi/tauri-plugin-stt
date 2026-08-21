@@ -124,7 +124,7 @@ impl<R: Runtime> Recognizer for Stt<R> {
     fn status(&self, language: &str) -> RecognizerStatus {
         let model_installed = self
             .get_model_info_for_language(language)
-            .map(|(name, _)| self.get_models_dir().join(name).exists())
+            .map(|spec| spec.is_installed_in(&self.get_models_dir()))
             .unwrap_or(false);
         RecognizerStatus {
             available: true,
