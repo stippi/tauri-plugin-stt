@@ -1,0 +1,76 @@
+# cargo-deny configuration: supply-chain checks for the plugin crate.
+#
+#   cargo deny check              # everything
+#   cargo deny check advisories   # one section
+#
+# Runs in CI (`.github/workflows/deny.yml`) on every push and pull request
+# and once a week, so new RustSec advisories surface even without a code
+# change. Reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories (RustSec database)
+# ---------------------------------------------------------------------------
+[advisories]
+yanked = "warn"
+# Only unmaintained crates the plugin depends on *directly* fail the check.
+# The tauri tree pulls in a tail of unmaintained transitive crates (unic-*,
+# proc-macro-error, fxhash, ...) we cannot replace from here.
+unmaintained = "workspace"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "CC0-1.0",
+    # Weak, file-level copyleft (cssparser, option-ext, ...): fine as long as
+    # those crates are used unmodified.
+    "MPL-2.0",
+    # Mozilla root certificate bundle (webpki-roots).
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+# ---------------------------------------------------------------------------
+# Bans
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
