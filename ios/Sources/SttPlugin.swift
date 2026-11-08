@@ -780,6 +780,6 @@ class SttPlugin: Plugin, SFSpeechRecognitionTaskDelegate {
 }
 
 @_cdecl("init_plugin_stt")
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
     return SttPlugin()
 }
