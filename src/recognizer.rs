@@ -84,11 +84,13 @@ pub struct RecognizerStatus {
     pub available: bool,
     /// Why not, when `available` is false.
     pub reason: Option<String>,
-    /// Whether the language's model is present. Always `true` on iOS: the
-    /// OS recognizer needs no model, and `SpeechAnalyzer` assets download in
-    /// the background on first use while sessions fall back to it.
+    /// Whether the language's model is present. iOS 26+: whether
+    /// `SpeechAnalyzer`'s assets are installed (without them sessions fall
+    /// back to `SFSpeechRecognizer`); before iOS 26 always `true`.
     pub model_installed: bool,
-    /// Whether the platform needs a model download step at all.
+    /// Whether the platform has a model download step for this language
+    /// (desktop: Vosk; iOS 26+: `SpeechAnalyzer` assets, when an analyzer
+    /// transcriber covers the language).
     pub needs_model_download: bool,
 }
 
@@ -107,12 +109,15 @@ pub trait Recognizer: Send + Sync {
         on_event: RecognizerCallback,
     ) -> crate::Result<Box<dyn RecognizerSession>>;
 
-    /// Availability and model status for `language`. Non-blocking.
+    /// Availability and model status for `language`. May block briefly (iOS
+    /// asks the Speech framework); call it off the main thread.
     fn status(&self, language: &str) -> RecognizerStatus;
 
     /// Make sure the model for `language` is present, downloading it if
-    /// needed. **Blocking**; progress is emitted as `stt://download-progress`.
-    /// A no-op on platforms without a model download step.
+    /// needed. **Blocking**; progress is emitted as `stt://download-progress`
+    /// (`status` "downloading" with `progress` 0–99, then "complete"). iOS
+    /// 26+: installs `SpeechAnalyzer` assets. A no-op on platforms without a
+    /// model download step.
     fn install_model(&self, language: &str) -> crate::Result<()>;
 
     /// Get recognition for `language` ready before the first session, so

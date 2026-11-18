@@ -327,82 +327,32 @@ final class PreparedAnalyzer {
         Task { await analyzer.cancelAndFinishNow() }
     }
 
-    /// `SpeechTranscriber` where the device supports it and covers the
-    /// locale, else `DictationTranscriber`; nil when neither is usable now.
+    /// Prepare the transcriber `TranscriberChoice.pick` selects; nil when
+    /// none is usable right now (missing assets start downloading).
     /// `sourceFormat` is a hint for the analyzer's preferred input format.
     static func make(locale: Locale, interimResults: Bool, sourceFormat: AVAudioFormat?) async -> PreparedAnalyzer? {
-        if SpeechTranscriber.isAvailable,
-           let matched = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
-            let module = SpeechTranscriber(
-                locale: matched,
-                preset: interimResults ? .progressiveTranscription : .transcription
-            )
-            return await prepare(
-                moduleName: "SpeechTranscriber", module: module, locale: matched, sourceFormat: sourceFormat,
-                consume: { stream in
-                    Task {
-                        do {
-                            for try await result in module.results {
-                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
-                            }
-                            stream.resultsEnded(nil)
-                        } catch {
-                            stream.resultsEnded(error)
-                        }
-                    }
-                }
-            )
+        guard let choice = await TranscriberChoice.pick(locale: locale, interimResults: interimResults) else {
+            NSLog("[AnalyzerStream] no transcriber for %@", locale.identifier)
+            return nil
         }
-        if let matched = await DictationTranscriber.supportedLocale(equivalentTo: locale) {
-            let module = DictationTranscriber(
-                locale: matched,
-                preset: interimResults ? .progressiveLongDictation : .longDictation
-            )
-            return await prepare(
-                moduleName: "DictationTranscriber", module: module, locale: matched, sourceFormat: sourceFormat,
-                consume: { stream in
-                    Task {
-                        do {
-                            for try await result in module.results {
-                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
-                            }
-                            stream.resultsEnded(nil)
-                        } catch {
-                            stream.resultsEnded(error)
-                        }
-                    }
-                }
-            )
-        }
-        NSLog("[AnalyzerStream] no transcriber for %@", locale.identifier)
-        return nil
-    }
-
-    private static func prepare(
-        moduleName: String,
-        module: any SpeechModule,
-        locale: Locale,
-        sourceFormat: AVAudioFormat?,
-        consume: @escaping (AnalyzerStream) -> Task<Void, Never>
-    ) async -> PreparedAnalyzer? {
-        let status = await AssetInventory.status(forModules: [module])
+        let status = await AssetInventory.status(forModules: [choice.module])
         guard status == .installed else {
             NSLog("[AnalyzerStream] %@ assets for %@ not installed (%@)",
-                  moduleName, locale.identifier, String(describing: status))
+                  choice.moduleName, choice.locale.identifier, String(describing: status))
             if status != .unsupported {
-                AssetDownloads.shared.ensure(module: module, key: "\(moduleName)/\(locale.identifier)")
+                AssetDownloads.shared.ensure(module: choice.module, key: choice.key)
             }
             return nil
         }
         guard let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-            compatibleWith: [module],
+            compatibleWith: [choice.module],
             considering: sourceFormat
         ) else {
             NSLog("[AnalyzerStream] no compatible audio format")
             return nil
         }
         let analyzer = SpeechAnalyzer(
-            modules: [module],
+            modules: [choice.module],
             options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .lingering)
         )
         do {
@@ -411,7 +361,134 @@ final class PreparedAnalyzer {
             NSLog("[AnalyzerStream] prepareToAnalyze failed: %@", error.localizedDescription)
             return nil
         }
-        return PreparedAnalyzer(moduleName: moduleName, analyzer: analyzer, targetFormat: targetFormat, consume: consume)
+        return PreparedAnalyzer(
+            moduleName: choice.moduleName, analyzer: analyzer,
+            targetFormat: targetFormat, consume: choice.consume
+        )
+    }
+}
+
+/// Which transcriber serves a locale: `SpeechTranscriber` where the device
+/// supports it and covers the locale, else `DictationTranscriber`.
+@available(iOS 26, macOS 26, *)
+struct TranscriberChoice {
+    let moduleName: String
+    let module: any SpeechModule
+    /// The transcriber's own locale equivalent to the requested one.
+    let locale: Locale
+    /// Starts the module's result consumer for a stream. A closure because
+    /// the two transcriber types have unrelated `Result` types.
+    let consume: (AnalyzerStream) -> Task<Void, Never>
+
+    /// Identifies the asset set (transcriber + locale).
+    var key: String { "\(moduleName)/\(locale.identifier)" }
+
+    static func pick(locale: Locale, interimResults: Bool) async -> TranscriberChoice? {
+        if SpeechTranscriber.isAvailable,
+           let matched = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
+            let module = SpeechTranscriber(
+                locale: matched,
+                preset: interimResults ? .progressiveTranscription : .transcription
+            )
+            return TranscriberChoice(moduleName: "SpeechTranscriber", module: module, locale: matched) { stream in
+                Task {
+                    do {
+                        for try await result in module.results {
+                            stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                        }
+                        stream.resultsEnded(nil)
+                    } catch {
+                        stream.resultsEnded(error)
+                    }
+                }
+            }
+        }
+        if let matched = await DictationTranscriber.supportedLocale(equivalentTo: locale) {
+            let module = DictationTranscriber(
+                locale: matched,
+                preset: interimResults ? .progressiveLongDictation : .longDictation
+            )
+            return TranscriberChoice(moduleName: "DictationTranscriber", module: module, locale: matched) { stream in
+                Task {
+                    do {
+                        for try await result in module.results {
+                            stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                        }
+                        stream.resultsEnded(nil)
+                    } catch {
+                        stream.resultsEnded(error)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Model assets (status and foreground install)
+
+/// Asset state of the transcriber that would serve a locale, for the host's
+/// settings UI. Raw values are the C ABI of `stt_stream_model_status`.
+@available(iOS 26, macOS 26, *)
+enum SpeechAssets {
+    enum State: Int32 {
+        /// No analyzer transcriber covers the locale (SFSpeechRecognizer
+        /// still serves it).
+        case unsupported = 0
+        case installed = 1
+        case notInstalled = 2
+        case downloading = 3
+    }
+
+    static func state(locale: Locale) async -> State {
+        guard let choice = await TranscriberChoice.pick(locale: locale, interimResults: true) else {
+            return .unsupported
+        }
+        switch await AssetInventory.status(forModules: [choice.module]) {
+        case .installed: return .installed
+        case .downloading: return .downloading
+        case .supported: return .notInstalled
+        default: return .unsupported
+        }
+    }
+
+    enum InstallResult: Int32 {
+        case installed = 0
+        case unsupported = 1
+        case failed = 2
+    }
+
+    /// Download and install the assets, reporting progress (whole percent,
+    /// deduplicated) through `onProgress`; then prepare an analyzer so the
+    /// next session starts warm.
+    static func install(locale: Locale, onProgress: @escaping (Int32) -> Void) async -> InstallResult {
+        guard let choice = await TranscriberChoice.pick(locale: locale, interimResults: true) else {
+            return .unsupported
+        }
+        do {
+            if let request = try await AssetInventory.assetInstallationRequest(supporting: [choice.module]) {
+                NSLog("[AnalyzerStream] installing speech assets for %@", choice.key)
+                var last: Int32 = -1
+                let lock = NSLock()
+                let observation = request.progress.observe(\.fractionCompleted, options: [.initial, .new]) { progress, _ in
+                    let percent = Int32((progress.fractionCompleted * 100).rounded(.down))
+                    let changed = lock.withLock { () -> Bool in
+                        guard percent != last else { return false }
+                        last = percent
+                        return true
+                    }
+                    if changed { onProgress(min(percent, 99)) }
+                }
+                defer { observation.invalidate() }
+                try await request.downloadAndInstall()
+                NSLog("[AnalyzerStream] speech assets for %@ installed", choice.key)
+            }
+        } catch {
+            NSLog("[AnalyzerStream] asset install for %@ failed: %@", choice.key, error.localizedDescription)
+            return .failed
+        }
+        AnalyzerStream.prewarm(locale: locale)
+        return .installed
     }
 }
 
@@ -482,6 +559,22 @@ private final class AssetDownloads {
 }
 
 // MARK: - Blocking bridge
+
+/// Run `body` on the Swift concurrency pool and block until it returns.
+/// Never call this on a thread the awaited work might need (the main thread
+/// if it touched the main actor; nothing here does).
+@available(iOS 26, macOS 26, *)
+func blockingRun<T>(_ body: @escaping () async -> T) -> T {
+    let box = AwaitBox<T>()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task.detached(priority: .userInitiated) {
+        let result = await body()
+        box.lock.withLock { box.value = .some(result) }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return box.lock.withLock { box.value!! }
+}
 
 private final class AwaitBox<T> {
     let lock = NSLock()

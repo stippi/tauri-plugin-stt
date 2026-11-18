@@ -15,7 +15,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tauri::Runtime;
+use tauri::{Emitter, Runtime};
 
 use crate::mobile::Stt;
 use crate::recognizer::{
@@ -37,6 +37,45 @@ extern "C" {
     fn stt_stream_finish(id: u64);
     fn stt_stream_cancel(id: u64);
     fn stt_stream_prewarm(locale: *const c_char);
+    fn stt_stream_model_status(locale: *const c_char) -> i32;
+    fn stt_stream_install_model(locale: *const c_char) -> i32;
+}
+
+// Asset states (mirror Swift `SpeechAssets.State`; -1 = before iOS 26).
+const MODEL_INSTALLED: i32 = 1;
+const MODEL_NOT_INSTALLED: i32 = 2;
+const MODEL_DOWNLOADING: i32 = 3;
+
+// Install results (mirror Swift `SpeechAssets.InstallResult`).
+const INSTALL_OK: i32 = 0;
+const INSTALL_UNSUPPORTED: i32 = 1;
+
+type ProgressSink = Box<dyn Fn(u8) + Send + Sync>;
+
+/// Receiver of `rust_stt_stream_on_model_progress` while an install runs.
+/// Installs are serialized by [`install_lock`], so one slot is enough.
+fn progress_sink() -> &'static Mutex<Option<ProgressSink>> {
+    static SINK: OnceLock<Mutex<Option<ProgressSink>>> = OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(None))
+}
+
+fn install_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[no_mangle]
+pub extern "C" fn rust_stt_stream_on_model_progress(percent: i32) {
+    if let Ok(sink) = progress_sink().lock() {
+        if let Some(sink) = sink.as_ref() {
+            sink(percent.clamp(0, 100) as u8);
+        }
+    }
+}
+
+/// Name shown for Apple's speech assets in `stt://download-progress`.
+fn model_name(locale: &str) -> String {
+    format!("Apple Speech ({locale})")
 }
 
 // Authorization codes (mirror `stt_stream_authorization_status`).
@@ -223,20 +262,63 @@ impl<R: Runtime> Recognizer for Stt<R> {
         Ok(Box::new(IosSession { id, closed: false }))
     }
 
-    fn status(&self, _language: &str) -> RecognizerStatus {
+    fn status(&self, language: &str) -> RecognizerStatus {
         // SAFETY: plain FFI query.
         let auth = unsafe { stt_stream_authorization_status() };
         let denied = auth != AUTH_AUTHORIZED && auth != AUTH_UNDETERMINED;
+        // iOS 26+: SpeechAnalyzer's assets for the language. Without them
+        // recognition still works (SFSpeechRecognizer), but not on-device
+        // with the newer model, so the host gets to offer the download.
+        let assets = CString::new(widen_language(language))
+            .ok()
+            // SAFETY: `locale` outlives the call; Swift copies it.
+            .map(|locale| unsafe { stt_stream_model_status(locale.as_ptr()) })
+            .unwrap_or(-1);
         RecognizerStatus {
             available: !denied,
             reason: denied.then(|| "Speech recognition permission denied".to_string()),
-            model_installed: true,
-            needs_model_download: false,
+            model_installed: !matches!(assets, MODEL_NOT_INSTALLED | MODEL_DOWNLOADING),
+            needs_model_download: matches!(
+                assets,
+                MODEL_INSTALLED | MODEL_NOT_INSTALLED | MODEL_DOWNLOADING
+            ),
         }
     }
 
-    fn install_model(&self, _language: &str) -> crate::Result<()> {
-        Ok(())
+    fn install_model(&self, language: &str) -> crate::Result<()> {
+        let tag = widen_language(language);
+        let locale = CString::new(tag.clone())
+            .map_err(|_| crate::Error::ConfigError("Invalid language tag".to_string()))?;
+        let _serial = install_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let app = self.app().clone();
+        let model = model_name(&tag);
+        let emit = move |status: &str, progress: u8| {
+            let _ = app.emit(
+                "stt://download-progress",
+                serde_json::json!({ "status": status, "model": model, "progress": progress }),
+            );
+        };
+        let downloading = emit.clone();
+        if let Ok(mut sink) = progress_sink().lock() {
+            *sink = Some(Box::new(move |percent| downloading("downloading", percent)));
+        }
+        // SAFETY: `locale` outlives the call; blocks until the install ends.
+        let code = unsafe { stt_stream_install_model(locale.as_ptr()) };
+        if let Ok(mut sink) = progress_sink().lock() {
+            *sink = None;
+        }
+        match code {
+            INSTALL_OK => {
+                emit("complete", 100);
+                Ok(())
+            }
+            INSTALL_UNSUPPORTED => Err(crate::Error::NotAvailable(format!(
+                "No on-device speech model for {tag}"
+            ))),
+            _ => Err(crate::Error::NotAvailable(format!(
+                "Installing the speech model for {tag} failed"
+            ))),
+        }
     }
 
     fn prepare(&self, language: &str) {

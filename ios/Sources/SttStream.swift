@@ -29,6 +29,9 @@ func rust_stt_stream_on_error(_ id: UInt64, _ message: UnsafePointer<CChar>)
 @_silgen_name("rust_stt_stream_on_ended")
 func rust_stt_stream_on_ended(_ id: UInt64)
 
+@_silgen_name("rust_stt_stream_on_model_progress")
+func rust_stt_stream_on_model_progress(_ percent: Int32)
+
 /// Error codes returned by `stt_stream_start`. Mirrored in Rust.
 private enum StreamStartError: Int32 {
     case ok = 0
@@ -330,4 +333,30 @@ public func stt_stream_prewarm(_ locale: UnsafePointer<CChar>) {
     if #available(iOS 26, macOS 26, *) {
         AnalyzerStream.prewarm(locale: Locale(identifier: localeId))
     }
+}
+
+/// Asset state of the on-device analyzer for `locale`: -1 not applicable
+/// (before iOS 26: SFSpeechRecognizer needs no assets), else
+/// `SpeechAssets.State` (0 unsupported, 1 installed, 2 not installed,
+/// 3 downloading). Blocks briefly; call off the main thread.
+@_cdecl("stt_stream_model_status")
+public func stt_stream_model_status(_ locale: UnsafePointer<CChar>) -> Int32 {
+    let localeId = String(cString: locale)
+    guard #available(iOS 26, macOS 26, *) else { return -1 }
+    return blockingRun { await SpeechAssets.state(locale: Locale(identifier: localeId)) }.rawValue
+}
+
+/// Download and install the analyzer assets for `locale`, reporting progress
+/// through `rust_stt_stream_on_model_progress` (0–99). Blocks until done.
+/// Returns `SpeechAssets.InstallResult` (0 installed, 1 unsupported,
+/// 2 failed); 0 before iOS 26.
+@_cdecl("stt_stream_install_model")
+public func stt_stream_install_model(_ locale: UnsafePointer<CChar>) -> Int32 {
+    let localeId = String(cString: locale)
+    guard #available(iOS 26, macOS 26, *) else { return 0 }
+    return blockingRun {
+        await SpeechAssets.install(locale: Locale(identifier: localeId)) { percent in
+            rust_stt_stream_on_model_progress(percent)
+        }
+    }.rawValue
 }
