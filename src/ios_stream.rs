@@ -1,5 +1,7 @@
-//! iOS [`Recognizer`]: `SFSpeechAudioBufferRecognitionRequest` fed over the
-//! C ABI implemented in `ios/Sources/SttStream.swift`.
+//! iOS [`Recognizer`]: buffer-fed recognition over the C ABI implemented in
+//! `ios/Sources/SttStream.swift`. The Swift side picks the engine per
+//! session — `SpeechAnalyzer` on iOS 26+ when usable (`AnalyzerStream.swift`),
+//! else `SFSpeechAudioBufferRecognitionRequest` — behind the same callbacks.
 //!
 //! Rust mints session ids and registers the host's callback under them; the
 //! Swift side reports back through the `rust_stt_stream_on_*` exports below.

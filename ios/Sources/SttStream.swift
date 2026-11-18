@@ -39,8 +39,21 @@ private enum StreamStartError: Int32 {
     case alreadyRunning = 5
 }
 
-/// One recognition session fed from Rust.
-private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate {
+/// A recognition session fed from Rust. Two implementations: `SpeechStream`
+/// (`SFSpeechRecognizer`, every iOS version) and `AnalyzerStream`
+/// (`SpeechAnalyzer`, iOS 26+, always on-device; see AnalyzerStream.swift).
+protocol RecognitionStream: AnyObject {
+    var id: UInt64 { get }
+    /// Append PCM (mono Int16 at the session's sample rate). Any thread.
+    func feed(_ samples: UnsafePointer<Int16>, count: UInt32)
+    /// No more audio: deliver the final transcript, then `Ended`.
+    func finish()
+    /// Abort: `Ended` without a transcript.
+    func cancel()
+}
+
+/// One `SFSpeechRecognizer` session fed from Rust.
+private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate, RecognitionStream {
     let id: UInt64
     private let queue: DispatchQueue
     private let recognizer: SFSpeechRecognizer
@@ -184,17 +197,17 @@ private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate {
 }
 
 /// Live sessions by id. Ids are minted by Rust; a stale id is a no-op.
-private final class SttStreamRegistry {
+final class SttStreamRegistry {
     static let shared = SttStreamRegistry()
     private let lock = NSLock()
-    private var streams: [UInt64: SpeechStream] = [:]
+    private var streams: [UInt64: RecognitionStream] = [:]
 
-    func insert(_ stream: SpeechStream) {
+    func insert(_ stream: RecognitionStream) {
         lock.lock(); defer { lock.unlock() }
         streams[stream.id] = stream
     }
 
-    func get(_ id: UInt64) -> SpeechStream? {
+    func get(_ id: UInt64) -> RecognitionStream? {
         lock.lock(); defer { lock.unlock() }
         return streams[id]
     }
@@ -255,6 +268,22 @@ public func stt_stream_start(
         return StreamStartError.alreadyRunning.rawValue
     }
     let localeId = String(cString: locale)
+    // iOS 26+: Apple's newer on-device model, when it covers the locale and
+    // its assets are installed (a missing asset starts downloading in the
+    // background and this session falls back to SFSpeechRecognizer).
+    if #available(iOS 26, macOS 26, *) {
+        if let stream = AnalyzerStream.open(
+            id: id,
+            locale: Locale(identifier: localeId),
+            sampleRate: sampleRate,
+            interimResults: interimResults != 0
+        ) {
+            SttStreamRegistry.shared.insert(stream)
+            stream.start()
+            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz)", id, stream.moduleName, localeId, sampleRate)
+            return StreamStartError.ok.rawValue
+        }
+    }
     guard let stream = SpeechStream(
         id: id,
         locale: Locale(identifier: localeId),
@@ -273,7 +302,7 @@ public func stt_stream_start(
     }
     SttStreamRegistry.shared.insert(stream)
     stream.start()
-    NSLog("[SttStream %llu] started (%@, %.0f Hz)", id, localeId, sampleRate)
+    NSLog("[SttStream %llu] started SFSpeechRecognizer (%@, %.0f Hz, onDevice=%d)", id, localeId, sampleRate, onDevice)
     return StreamStartError.ok.rawValue
 }
 

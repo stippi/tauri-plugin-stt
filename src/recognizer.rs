@@ -6,8 +6,10 @@
 //! shape: *they* push PCM into the recognizer and get hypotheses back, without
 //! any webview or IPC bridge in between. That is what [`Recognizer`] is.
 //!
-//! - iOS: `SFSpeechAudioBufferRecognitionRequest` fed over a C ABI implemented
-//!   in `ios/Sources/SttStream.swift` (see [`crate::ios_stream`]).
+//! - iOS: fed over a C ABI implemented in `ios/Sources/` (see
+//!   [`crate::ios_stream`]). On iOS 26+ sessions use `SpeechAnalyzer`
+//!   (always on-device) when it covers the language and its assets are
+//!   installed; otherwise `SFSpeechAudioBufferRecognitionRequest`.
 //! - Desktop: an in-process Vosk recognizer over the plugin's model store.
 //! - Android: not implemented (`SpeechRecognizer` cannot be fed audio before
 //!   API 33, and this plugin has no host that needs it yet).
@@ -50,8 +52,10 @@ pub struct RecognizerConfig {
     pub sample_rate: u32,
     /// Whether to report `Partial` hypotheses.
     pub interim_results: bool,
-    /// iOS: require on-device recognition (offline; may be less accurate).
-    /// Ignored on desktop, where recognition is always local.
+    /// iOS: require on-device recognition from `SFSpeechRecognizer` (may be
+    /// less accurate). Sessions served by `SpeechAnalyzer` (iOS 26+) are
+    /// on-device regardless. Ignored on desktop, where recognition is always
+    /// local.
     pub on_device: bool,
 }
 
@@ -80,8 +84,9 @@ pub struct RecognizerStatus {
     pub available: bool,
     /// Why not, when `available` is false.
     pub reason: Option<String>,
-    /// Whether the language's model is present. Always `true` on platforms
-    /// where the OS ships the recognizer (iOS).
+    /// Whether the language's model is present. Always `true` on iOS: the
+    /// OS recognizer needs no model, and `SpeechAnalyzer` assets download in
+    /// the background on first use while sessions fall back to it.
     pub model_installed: bool,
     /// Whether the platform needs a model download step at all.
     pub needs_model_download: bool,
