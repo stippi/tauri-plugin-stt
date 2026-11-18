@@ -36,6 +36,7 @@ extern "C" {
     fn stt_stream_feed(id: u64, samples: *const i16, count: u32);
     fn stt_stream_finish(id: u64);
     fn stt_stream_cancel(id: u64);
+    fn stt_stream_prewarm(locale: *const c_char);
 }
 
 // Authorization codes (mirror `stt_stream_authorization_status`).
@@ -236,6 +237,15 @@ impl<R: Runtime> Recognizer for Stt<R> {
 
     fn install_model(&self, _language: &str) -> crate::Result<()> {
         Ok(())
+    }
+
+    fn prepare(&self, language: &str) {
+        let Ok(locale) = CString::new(widen_language(language)) else {
+            return;
+        };
+        // SAFETY: `locale` outlives the call; Swift copies it and returns
+        // immediately (the work runs on Swift's task pool).
+        unsafe { stt_stream_prewarm(locale.as_ptr()) };
     }
 
     fn request_authorization(&self) -> crate::Result<bool> {

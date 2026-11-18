@@ -320,3 +320,14 @@ public func stt_stream_finish(_ id: UInt64) {
 public func stt_stream_cancel(_ id: UInt64) {
     SttStreamRegistry.shared.get(id)?.cancel()
 }
+
+/// Get recognition for `locale` ready ahead of the first session: on iOS 26+
+/// prepares a `SpeechAnalyzer` (loading its model, or starting the asset
+/// download). Non-blocking; a no-op before iOS 26.
+@_cdecl("stt_stream_prewarm")
+public func stt_stream_prewarm(_ locale: UnsafePointer<CChar>) {
+    let localeId = String(cString: locale)
+    if #available(iOS 26, macOS 26, *) {
+        AnalyzerStream.prewarm(locale: Locale(identifier: localeId))
+    }
+}

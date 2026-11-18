@@ -115,6 +115,12 @@ pub trait Recognizer: Send + Sync {
     /// A no-op on platforms without a model download step.
     fn install_model(&self, language: &str) -> crate::Result<()>;
 
+    /// Get recognition for `language` ready before the first session, so
+    /// that session does not wait for a model to load. **Non-blocking**,
+    /// best effort, safe to call repeatedly. iOS 26+: prepares a
+    /// `SpeechAnalyzer` (or starts downloading its assets). Default: no-op.
+    fn prepare(&self, _language: &str) {}
+
     /// Ask the OS for speech-recognition permission if it has not been decided
     /// yet. **Blocking** until the user answers. Returns whether recognition
     /// is authorized. Always `Ok(true)` on desktop.

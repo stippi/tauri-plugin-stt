@@ -56,26 +56,18 @@ final class AnalyzerStream: RecognitionStream {
     /// it so a very short session never finalizes an analyzer not yet started.
     private var startTask: Task<Void, Never>?
 
-    private init(
-        id: UInt64,
-        moduleName: String,
-        analyzer: SpeechAnalyzer,
-        sourceFormat: AVAudioFormat,
-        targetFormat: AVAudioFormat,
-        interimResults: Bool,
-        consumeResults: @escaping (AnalyzerStream) -> Task<Void, Never>
-    ) {
+    private init(id: UInt64, prepared: PreparedAnalyzer, sourceFormat: AVAudioFormat, interimResults: Bool) {
         self.id = id
-        self.moduleName = moduleName
+        self.moduleName = prepared.moduleName
         self.queue = DispatchQueue(label: "com.yellowbites.stt-analyzer.\(id)", qos: .userInteractive)
-        self.analyzer = analyzer
+        self.analyzer = prepared.analyzer
         self.sourceFormat = sourceFormat
-        self.targetFormat = targetFormat
-        self.converter = sourceFormat == targetFormat
+        self.targetFormat = prepared.targetFormat
+        self.converter = sourceFormat == prepared.targetFormat
             ? nil
-            : AVAudioConverter(from: sourceFormat, to: targetFormat)
+            : AVAudioConverter(from: sourceFormat, to: prepared.targetFormat)
         self.interimResults = interimResults
-        self.consumeResults = consumeResults
+        self.consumeResults = prepared.consume
         var continuation: AsyncStream<AnalyzerInput>.Continuation!
         self.inputStream = AsyncStream(bufferingPolicy: .unbounded) { continuation = $0 }
         self.inputContinuation = continuation
@@ -84,9 +76,13 @@ final class AnalyzerStream: RecognitionStream {
     // MARK: Opening
 
     /// Set up an analyzer session, or nil when the caller should use
-    /// `SFSpeechRecognizer` instead. **Blocking** (it awaits the Speech
-    /// framework's async setup); call it off the main thread — Rust's
-    /// `Recognizer::open` already runs on a blocking-capable thread.
+    /// `SFSpeechRecognizer` instead.
+    ///
+    /// With an analyzer prepared in advance (`prewarm`) this returns
+    /// immediately. Otherwise it **blocks** on the Speech framework's async
+    /// setup — call it off the main thread; Rust's `Recognizer::open` already
+    /// runs on a blocking-capable thread. Either way the next session's
+    /// analyzer is prepared in the background right after.
     static func open(id: UInt64, locale: Locale, sampleRate: Double, interimResults: Bool) -> AnalyzerStream? {
         guard let sourceFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -94,116 +90,34 @@ final class AnalyzerStream: RecognitionStream {
             channels: 1,
             interleaved: false
         ) else { return nil }
-        // Model loading is the slow part and only happens on the first session
-        // (`modelRetention: .lingering` keeps it warm afterwards). If setup
-        // takes longer than this, the session goes to SFSpeechRecognizer and
-        // the analyzer is discarded once it is ready.
-        return blockingAwait(timeout: 4.0, onAbandoned: { $0.discard() }) {
-            await makeStream(id: id, locale: locale, sourceFormat: sourceFormat, interimResults: interimResults)
-        } ?? nil
-    }
-
-    private static func makeStream(
-        id: UInt64,
-        locale: Locale,
-        sourceFormat: AVAudioFormat,
-        interimResults: Bool
-    ) async -> AnalyzerStream? {
-        if SpeechTranscriber.isAvailable,
-           let matched = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
-            let module = SpeechTranscriber(
-                locale: matched,
-                preset: interimResults ? .progressiveTranscription : .transcription
-            )
-            return await prepare(
-                id: id, moduleName: "SpeechTranscriber", module: module, locale: matched,
-                sourceFormat: sourceFormat, interimResults: interimResults,
-                consume: { stream in
-                    Task {
-                        do {
-                            for try await result in module.results {
-                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
-                            }
-                            stream.resultsEnded(nil)
-                        } catch {
-                            stream.resultsEnded(error)
-                        }
-                    }
-                }
-            )
+        defer { AnalyzerPool.shared.refill(locale: locale) }
+        let prepared: PreparedAnalyzer?
+        if interimResults, let warm = AnalyzerPool.shared.take(locale: locale) {
+            prepared = warm
+        } else {
+            // Model loading is the slow part. If setup takes longer than
+            // this, the session goes to SFSpeechRecognizer and the late
+            // analyzer is discarded.
+            prepared = blockingAwait(timeout: 4.0, onAbandoned: { $0.discard() }) {
+                await PreparedAnalyzer.make(locale: locale, interimResults: interimResults, sourceFormat: sourceFormat)
+            } ?? nil
         }
-        if let matched = await DictationTranscriber.supportedLocale(equivalentTo: locale) {
-            let module = DictationTranscriber(
-                locale: matched,
-                preset: interimResults ? .progressiveLongDictation : .longDictation
-            )
-            return await prepare(
-                id: id, moduleName: "DictationTranscriber", module: module, locale: matched,
-                sourceFormat: sourceFormat, interimResults: interimResults,
-                consume: { stream in
-                    Task {
-                        do {
-                            for try await result in module.results {
-                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
-                            }
-                            stream.resultsEnded(nil)
-                        } catch {
-                            stream.resultsEnded(error)
-                        }
-                    }
-                }
-            )
-        }
-        NSLog("[AnalyzerStream %llu] no transcriber for %@", id, locale.identifier)
-        return nil
-    }
-
-    private static func prepare(
-        id: UInt64,
-        moduleName: String,
-        module: any SpeechModule,
-        locale: Locale,
-        sourceFormat: AVAudioFormat,
-        interimResults: Bool,
-        consume: @escaping (AnalyzerStream) -> Task<Void, Never>
-    ) async -> AnalyzerStream? {
-        let status = await AssetInventory.status(forModules: [module])
-        guard status == .installed else {
-            NSLog("[AnalyzerStream %llu] %@ assets for %@ not installed (%@)",
-                  id, moduleName, locale.identifier, String(describing: status))
-            if status != .unsupported {
-                AssetDownloads.shared.ensure(module: module, key: "\(moduleName)/\(locale.identifier)")
-            }
-            return nil
-        }
-        guard let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-            compatibleWith: [module],
-            considering: sourceFormat
-        ) else {
-            NSLog("[AnalyzerStream %llu] no compatible audio format", id)
-            return nil
-        }
-        let analyzer = SpeechAnalyzer(
-            modules: [module],
-            options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .lingering)
-        )
-        do {
-            try await analyzer.prepareToAnalyze(in: targetFormat)
-        } catch {
-            NSLog("[AnalyzerStream %llu] prepareToAnalyze failed: %@", id, error.localizedDescription)
-            return nil
-        }
-        let stream = AnalyzerStream(
-            id: id, moduleName: moduleName, analyzer: analyzer,
-            sourceFormat: sourceFormat, targetFormat: targetFormat,
-            interimResults: interimResults, consumeResults: consume
-        )
-        guard stream.converter != nil || sourceFormat == targetFormat else {
+        guard let prepared = prepared else { return nil }
+        let stream = AnalyzerStream(id: id, prepared: prepared, sourceFormat: sourceFormat, interimResults: interimResults)
+        guard stream.converter != nil || sourceFormat == prepared.targetFormat else {
             NSLog("[AnalyzerStream %llu] cannot convert %@ to %@", id,
-                  sourceFormat.description, targetFormat.description)
+                  sourceFormat.description, prepared.targetFormat.description)
+            prepared.discard()
             return nil
         }
         return stream
+    }
+
+    /// Prepare an analyzer for `locale` in the background so the next `open`
+    /// starts without waiting for the model (and start downloading its
+    /// assets if they are missing). Non-blocking.
+    static func prewarm(locale: Locale) {
+        AnalyzerPool.shared.refill(locale: locale)
     }
 
     // MARK: RecognitionStream
@@ -353,12 +267,6 @@ final class AnalyzerStream: RecognitionStream {
         Task { await analyzer.cancelAndFinishNow() }
     }
 
-    /// Tear down a stream that was set up but never handed to the host.
-    fileprivate func discard() {
-        closeInput()
-        stopAnalyzer()
-    }
-
     /// Convert to the analyzer's format (called under `feedLock`; the
     /// converter keeps resampler state across calls).
     private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
@@ -385,6 +293,161 @@ final class AnalyzerStream: RecognitionStream {
             return nil
         }
         return output.frameLength > 0 ? output : nil
+    }
+}
+
+// MARK: - Prepared analyzers
+
+/// A `SpeechAnalyzer` with its transcriber, model loaded and ready to start
+/// on its first input. Single use: a stream takes it and finishes it.
+@available(iOS 26, macOS 26, *)
+final class PreparedAnalyzer {
+    let moduleName: String
+    let analyzer: SpeechAnalyzer
+    let targetFormat: AVAudioFormat
+    /// Starts the module's result consumer for a stream. A closure because
+    /// the two transcriber types have unrelated `Result` types.
+    let consume: (AnalyzerStream) -> Task<Void, Never>
+
+    private init(
+        moduleName: String,
+        analyzer: SpeechAnalyzer,
+        targetFormat: AVAudioFormat,
+        consume: @escaping (AnalyzerStream) -> Task<Void, Never>
+    ) {
+        self.moduleName = moduleName
+        self.analyzer = analyzer
+        self.targetFormat = targetFormat
+        self.consume = consume
+    }
+
+    /// Release an analyzer nobody will use.
+    func discard() {
+        let analyzer = self.analyzer
+        Task { await analyzer.cancelAndFinishNow() }
+    }
+
+    /// `SpeechTranscriber` where the device supports it and covers the
+    /// locale, else `DictationTranscriber`; nil when neither is usable now.
+    /// `sourceFormat` is a hint for the analyzer's preferred input format.
+    static func make(locale: Locale, interimResults: Bool, sourceFormat: AVAudioFormat?) async -> PreparedAnalyzer? {
+        if SpeechTranscriber.isAvailable,
+           let matched = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
+            let module = SpeechTranscriber(
+                locale: matched,
+                preset: interimResults ? .progressiveTranscription : .transcription
+            )
+            return await prepare(
+                moduleName: "SpeechTranscriber", module: module, locale: matched, sourceFormat: sourceFormat,
+                consume: { stream in
+                    Task {
+                        do {
+                            for try await result in module.results {
+                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                            }
+                            stream.resultsEnded(nil)
+                        } catch {
+                            stream.resultsEnded(error)
+                        }
+                    }
+                }
+            )
+        }
+        if let matched = await DictationTranscriber.supportedLocale(equivalentTo: locale) {
+            let module = DictationTranscriber(
+                locale: matched,
+                preset: interimResults ? .progressiveLongDictation : .longDictation
+            )
+            return await prepare(
+                moduleName: "DictationTranscriber", module: module, locale: matched, sourceFormat: sourceFormat,
+                consume: { stream in
+                    Task {
+                        do {
+                            for try await result in module.results {
+                                stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                            }
+                            stream.resultsEnded(nil)
+                        } catch {
+                            stream.resultsEnded(error)
+                        }
+                    }
+                }
+            )
+        }
+        NSLog("[AnalyzerStream] no transcriber for %@", locale.identifier)
+        return nil
+    }
+
+    private static func prepare(
+        moduleName: String,
+        module: any SpeechModule,
+        locale: Locale,
+        sourceFormat: AVAudioFormat?,
+        consume: @escaping (AnalyzerStream) -> Task<Void, Never>
+    ) async -> PreparedAnalyzer? {
+        let status = await AssetInventory.status(forModules: [module])
+        guard status == .installed else {
+            NSLog("[AnalyzerStream] %@ assets for %@ not installed (%@)",
+                  moduleName, locale.identifier, String(describing: status))
+            if status != .unsupported {
+                AssetDownloads.shared.ensure(module: module, key: "\(moduleName)/\(locale.identifier)")
+            }
+            return nil
+        }
+        guard let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [module],
+            considering: sourceFormat
+        ) else {
+            NSLog("[AnalyzerStream] no compatible audio format")
+            return nil
+        }
+        let analyzer = SpeechAnalyzer(
+            modules: [module],
+            options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .lingering)
+        )
+        do {
+            try await analyzer.prepareToAnalyze(in: targetFormat)
+        } catch {
+            NSLog("[AnalyzerStream] prepareToAnalyze failed: %@", error.localizedDescription)
+            return nil
+        }
+        return PreparedAnalyzer(moduleName: moduleName, analyzer: analyzer, targetFormat: targetFormat, consume: consume)
+    }
+}
+
+/// At most one ready analyzer per locale (progressive preset, which is what
+/// interim-result sessions use). Filled by `prewarm` and after every `open`,
+/// so push-to-talk never waits for model loading after the first prewarm.
+@available(iOS 26, macOS 26, *)
+private final class AnalyzerPool {
+    static let shared = AnalyzerPool()
+    private let lock = NSLock()
+    private var ready: [String: PreparedAnalyzer] = [:]
+    private var preparing = Set<String>()
+
+    func take(locale: Locale) -> PreparedAnalyzer? {
+        lock.withLock { ready.removeValue(forKey: locale.identifier) }
+    }
+
+    func refill(locale: Locale) {
+        let key = locale.identifier
+        let start = lock.withLock { () -> Bool in
+            guard ready[key] == nil, !preparing.contains(key) else { return false }
+            preparing.insert(key)
+            return true
+        }
+        guard start else { return }
+        Task.detached(priority: .utility) {
+            let hint = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: false)
+            let prepared = await PreparedAnalyzer.make(locale: locale, interimResults: true, sourceFormat: hint)
+            self.lock.withLock {
+                self.preparing.remove(key)
+                if let prepared = prepared {
+                    self.ready[key] = prepared
+                    NSLog("[AnalyzerStream] %@ ready for %@", prepared.moduleName, key)
+                }
+            }
+        }
     }
 }
 
