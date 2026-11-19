@@ -60,6 +60,9 @@ final class AnalyzerStream: RecognitionStream {
     private var confidenceChars = 0
     private var ended = false
     private var finishing = false
+    /// The results sequence ended on its own: the analyzer is done and needs
+    /// no stopping.
+    private var analyzerFinished = false
     private let interimResults: Bool
     private var resultsTask: Task<Void, Never>?
     /// `analyzer.start` returns once analysis is running; finishing waits for
@@ -161,6 +164,8 @@ final class AnalyzerStream: RecognitionStream {
     /// buffered by the input stream.
     func start() {
         queue.async {
+            // Cancelled before it started: nothing to start.
+            guard !self.ended else { return }
             self.resultsTask = self.consumeResults(self)
             let analyzer = self.analyzer
             let input = self.inputStream
@@ -220,18 +225,13 @@ final class AnalyzerStream: RecognitionStream {
                 guard let self = self, !self.ended else { return }
                 NSLog("[AnalyzerStream %llu] finalize timeout — using current transcript", self.id)
                 self.emitFinalAndEnd()
-                self.stopAnalyzer()
             }
         }
     }
 
     func cancel() {
         closeInput()
-        queue.async {
-            guard !self.ended else { return }
-            self.stopAnalyzer()
-            self.end()
-        }
+        queue.async { self.end() }
     }
 
     // MARK: Results (any thread → queue)
@@ -262,7 +262,10 @@ final class AnalyzerStream: RecognitionStream {
             fail(error)
             return
         }
-        queue.async { self.emitFinalAndEnd() }
+        queue.async {
+            self.analyzerFinished = true
+            self.emitFinalAndEnd()
+        }
     }
 
     private func fail(_ error: Error) {
@@ -276,7 +279,6 @@ final class AnalyzerStream: RecognitionStream {
                 return
             }
             self.sink.error(error.localizedDescription)
-            self.stopAnalyzer()
             self.end()
         }
     }
@@ -298,9 +300,16 @@ final class AnalyzerStream: RecognitionStream {
         end()
     }
 
+    /// The one place a session is torn down, however it ends: no more input
+    /// (a failed child of a multi-language session would otherwise keep
+    /// being fed) and the analyzer stopped unless it finished on its own.
     private func end() {
         guard !ended else { return }
         ended = true
+        closeInput()
+        if !analyzerFinished {
+            stopAnalyzer()
+        }
         resultsTask?.cancel()
         sink.ended()
     }
@@ -313,9 +322,15 @@ final class AnalyzerStream: RecognitionStream {
         inputContinuation.finish()
     }
 
+    /// Stop the analyzer once its start has returned — stopping it before
+    /// would let a late `start` bring it back up with nobody left to stop it.
     private func stopAnalyzer() {
         let analyzer = self.analyzer
-        Task { await analyzer.cancelAndFinishNow() }
+        let started = self.startTask
+        Task {
+            await started?.value
+            await analyzer.cancelAndFinishNow()
+        }
     }
 
     /// Convert to the analyzer's format (called under `feedLock`; the
