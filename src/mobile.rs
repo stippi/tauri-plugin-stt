@@ -11,22 +11,30 @@ tauri::ios_plugin_binding!(init_plugin_stt);
 
 /// Initializes the Kotlin or Swift plugin classes
 pub fn init<R: Runtime, C: DeserializeOwned>(
-    _app: &AppHandle<R>,
+    app: &AppHandle<R>,
     api: PluginApi<R, C>,
 ) -> crate::Result<Stt<R>> {
     #[cfg(target_os = "android")]
     let handle = api.register_android_plugin("io.affex.stt", "SttPlugin")?;
     #[cfg(target_os = "ios")]
     let handle = api.register_ios_plugin(init_plugin_stt)?;
-    Ok(Stt(handle))
+    Ok(Stt(handle, app.clone()))
 }
 
 /// Access to the STT APIs.
-pub struct Stt<R: Runtime>(PluginHandle<R>);
+pub struct Stt<R: Runtime>(PluginHandle<R>, AppHandle<R>);
 
 impl<R: Runtime> Clone for Stt<R> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
+    }
+}
+
+impl<R: Runtime> Stt<R> {
+    /// The app, for emitting plugin events (`stt://download-progress`).
+    #[allow(dead_code)]
+    pub(crate) fn app(&self) -> &AppHandle<R> {
+        &self.1
     }
 }
 

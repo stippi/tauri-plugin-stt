@@ -6,8 +6,10 @@
 //! shape: *they* push PCM into the recognizer and get hypotheses back, without
 //! any webview or IPC bridge in between. That is what [`Recognizer`] is.
 //!
-//! - iOS: `SFSpeechAudioBufferRecognitionRequest` fed over a C ABI implemented
-//!   in `ios/Sources/SttStream.swift` (see [`crate::ios_stream`]).
+//! - iOS: fed over a C ABI implemented in `ios/Sources/` (see
+//!   [`crate::ios_stream`]). On iOS 26+ sessions use `SpeechAnalyzer`
+//!   (always on-device) when it covers the language and its assets are
+//!   installed; otherwise `SFSpeechAudioBufferRecognitionRequest`.
 //! - Desktop: an in-process Vosk recognizer over the plugin's model store.
 //! - Android: not implemented (`SpeechRecognizer` cannot be fed audio before
 //!   API 33, and this plugin has no host that needs it yet).
@@ -50,8 +52,10 @@ pub struct RecognizerConfig {
     pub sample_rate: u32,
     /// Whether to report `Partial` hypotheses.
     pub interim_results: bool,
-    /// iOS: require on-device recognition (offline; may be less accurate).
-    /// Ignored on desktop, where recognition is always local.
+    /// iOS: require on-device recognition from `SFSpeechRecognizer` (may be
+    /// less accurate). Sessions served by `SpeechAnalyzer` (iOS 26+) are
+    /// on-device regardless. Ignored on desktop, where recognition is always
+    /// local.
     pub on_device: bool,
 }
 
@@ -80,10 +84,13 @@ pub struct RecognizerStatus {
     pub available: bool,
     /// Why not, when `available` is false.
     pub reason: Option<String>,
-    /// Whether the language's model is present. Always `true` on platforms
-    /// where the OS ships the recognizer (iOS).
+    /// Whether the language's model is present. iOS 26+: whether
+    /// `SpeechAnalyzer`'s assets are installed (without them sessions fall
+    /// back to `SFSpeechRecognizer`); before iOS 26 always `true`.
     pub model_installed: bool,
-    /// Whether the platform needs a model download step at all.
+    /// Whether the platform has a model download step for this language
+    /// (desktop: Vosk; iOS 26+: `SpeechAnalyzer` assets, when an analyzer
+    /// transcriber covers the language).
     pub needs_model_download: bool,
 }
 
@@ -102,13 +109,22 @@ pub trait Recognizer: Send + Sync {
         on_event: RecognizerCallback,
     ) -> crate::Result<Box<dyn RecognizerSession>>;
 
-    /// Availability and model status for `language`. Non-blocking.
+    /// Availability and model status for `language`. May block briefly (iOS
+    /// asks the Speech framework); call it off the main thread.
     fn status(&self, language: &str) -> RecognizerStatus;
 
     /// Make sure the model for `language` is present, downloading it if
-    /// needed. **Blocking**; progress is emitted as `stt://download-progress`.
-    /// A no-op on platforms without a model download step.
+    /// needed. **Blocking**; progress is emitted as `stt://download-progress`
+    /// (`status` "downloading" with `progress` 0–99, then "complete"). iOS
+    /// 26+: installs `SpeechAnalyzer` assets. A no-op on platforms without a
+    /// model download step.
     fn install_model(&self, language: &str) -> crate::Result<()>;
+
+    /// Get recognition for `language` ready before the first session, so
+    /// that session does not wait for a model to load. **Non-blocking**,
+    /// best effort, safe to call repeatedly. iOS 26+: prepares a
+    /// `SpeechAnalyzer` (or starts downloading its assets). Default: no-op.
+    fn prepare(&self, _language: &str) {}
 
     /// Ask the OS for speech-recognition permission if it has not been decided
     /// yet. **Blocking** until the user answers. Returns whether recognition

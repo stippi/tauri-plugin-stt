@@ -29,6 +29,9 @@ func rust_stt_stream_on_error(_ id: UInt64, _ message: UnsafePointer<CChar>)
 @_silgen_name("rust_stt_stream_on_ended")
 func rust_stt_stream_on_ended(_ id: UInt64)
 
+@_silgen_name("rust_stt_stream_on_model_progress")
+func rust_stt_stream_on_model_progress(_ percent: Int32)
+
 /// Error codes returned by `stt_stream_start`. Mirrored in Rust.
 private enum StreamStartError: Int32 {
     case ok = 0
@@ -39,8 +42,21 @@ private enum StreamStartError: Int32 {
     case alreadyRunning = 5
 }
 
-/// One recognition session fed from Rust.
-private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate {
+/// A recognition session fed from Rust. Two implementations: `SpeechStream`
+/// (`SFSpeechRecognizer`, every iOS version) and `AnalyzerStream`
+/// (`SpeechAnalyzer`, iOS 26+, always on-device; see AnalyzerStream.swift).
+protocol RecognitionStream: AnyObject {
+    var id: UInt64 { get }
+    /// Append PCM (mono Int16 at the session's sample rate). Any thread.
+    func feed(_ samples: UnsafePointer<Int16>, count: UInt32)
+    /// No more audio: deliver the final transcript, then `Ended`.
+    func finish()
+    /// Abort: `Ended` without a transcript.
+    func cancel()
+}
+
+/// One `SFSpeechRecognizer` session fed from Rust.
+private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate, RecognitionStream {
     let id: UInt64
     private let queue: DispatchQueue
     private let recognizer: SFSpeechRecognizer
@@ -184,17 +200,17 @@ private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate {
 }
 
 /// Live sessions by id. Ids are minted by Rust; a stale id is a no-op.
-private final class SttStreamRegistry {
+final class SttStreamRegistry {
     static let shared = SttStreamRegistry()
     private let lock = NSLock()
-    private var streams: [UInt64: SpeechStream] = [:]
+    private var streams: [UInt64: RecognitionStream] = [:]
 
-    func insert(_ stream: SpeechStream) {
+    func insert(_ stream: RecognitionStream) {
         lock.lock(); defer { lock.unlock() }
         streams[stream.id] = stream
     }
 
-    func get(_ id: UInt64) -> SpeechStream? {
+    func get(_ id: UInt64) -> RecognitionStream? {
         lock.lock(); defer { lock.unlock() }
         return streams[id]
     }
@@ -255,6 +271,22 @@ public func stt_stream_start(
         return StreamStartError.alreadyRunning.rawValue
     }
     let localeId = String(cString: locale)
+    // iOS 26+: Apple's newer on-device model, when it covers the locale and
+    // its assets are installed (a missing asset starts downloading in the
+    // background and this session falls back to SFSpeechRecognizer).
+    if #available(iOS 26, macOS 26, *) {
+        if let stream = AnalyzerStream.open(
+            id: id,
+            locale: Locale(identifier: localeId),
+            sampleRate: sampleRate,
+            interimResults: interimResults != 0
+        ) {
+            SttStreamRegistry.shared.insert(stream)
+            stream.start()
+            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz)", id, stream.moduleName, localeId, sampleRate)
+            return StreamStartError.ok.rawValue
+        }
+    }
     guard let stream = SpeechStream(
         id: id,
         locale: Locale(identifier: localeId),
@@ -273,7 +305,7 @@ public func stt_stream_start(
     }
     SttStreamRegistry.shared.insert(stream)
     stream.start()
-    NSLog("[SttStream %llu] started (%@, %.0f Hz)", id, localeId, sampleRate)
+    NSLog("[SttStream %llu] started SFSpeechRecognizer (%@, %.0f Hz, onDevice=%d)", id, localeId, sampleRate, onDevice)
     return StreamStartError.ok.rawValue
 }
 
@@ -290,4 +322,41 @@ public func stt_stream_finish(_ id: UInt64) {
 @_cdecl("stt_stream_cancel")
 public func stt_stream_cancel(_ id: UInt64) {
     SttStreamRegistry.shared.get(id)?.cancel()
+}
+
+/// Get recognition for `locale` ready ahead of the first session: on iOS 26+
+/// prepares a `SpeechAnalyzer` (loading its model, or starting the asset
+/// download). Non-blocking; a no-op before iOS 26.
+@_cdecl("stt_stream_prewarm")
+public func stt_stream_prewarm(_ locale: UnsafePointer<CChar>) {
+    let localeId = String(cString: locale)
+    if #available(iOS 26, macOS 26, *) {
+        AnalyzerStream.prewarm(locale: Locale(identifier: localeId))
+    }
+}
+
+/// Asset state of the on-device analyzer for `locale`: -1 not applicable
+/// (before iOS 26: SFSpeechRecognizer needs no assets), else
+/// `SpeechAssets.State` (0 unsupported, 1 installed, 2 not installed,
+/// 3 downloading). Blocks briefly; call off the main thread.
+@_cdecl("stt_stream_model_status")
+public func stt_stream_model_status(_ locale: UnsafePointer<CChar>) -> Int32 {
+    let localeId = String(cString: locale)
+    guard #available(iOS 26, macOS 26, *) else { return -1 }
+    return blockingRun { await SpeechAssets.state(locale: Locale(identifier: localeId)) }.rawValue
+}
+
+/// Download and install the analyzer assets for `locale`, reporting progress
+/// through `rust_stt_stream_on_model_progress` (0–99). Blocks until done.
+/// Returns `SpeechAssets.InstallResult` (0 installed, 1 unsupported,
+/// 2 failed); 0 before iOS 26.
+@_cdecl("stt_stream_install_model")
+public func stt_stream_install_model(_ locale: UnsafePointer<CChar>) -> Int32 {
+    let localeId = String(cString: locale)
+    guard #available(iOS 26, macOS 26, *) else { return 0 }
+    return blockingRun {
+        await SpeechAssets.install(locale: Locale(identifier: localeId)) { percent in
+            rust_stt_stream_on_model_progress(percent)
+        }
+    }.rawValue
 }
