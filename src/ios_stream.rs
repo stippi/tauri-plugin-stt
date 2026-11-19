@@ -32,6 +32,8 @@ extern "C" {
         sample_rate: f64,
         interim_results: u32,
         on_device: u32,
+        extra_locales: *const c_char,
+        contextual_strings: *const c_char,
     ) -> i32;
     fn stt_stream_feed(id: u64, samples: *const i16, count: u32);
     fn stt_stream_finish(id: u64);
@@ -135,6 +137,23 @@ pub extern "C" fn rust_stt_stream_on_final(id: u64, text: *const c_char) {
 }
 
 #[no_mangle]
+pub extern "C" fn rust_stt_stream_on_alternative(
+    id: u64,
+    locale: *const c_char,
+    text: *const c_char,
+    confidence: f64,
+) {
+    deliver(
+        id,
+        RecognizerEvent::Alternative {
+            language: c_string_arg(locale),
+            text: c_string_arg(text),
+            confidence: (0.0..=1.0).contains(&confidence).then_some(confidence),
+        },
+    );
+}
+
+#[no_mangle]
 pub extern "C" fn rust_stt_stream_on_error(id: u64, message: *const c_char) {
     deliver(id, RecognizerEvent::Error(c_string_arg(message)));
 }
@@ -199,6 +218,17 @@ impl Drop for IosSession {
     }
 }
 
+/// Join entries for the C ABI's newline-separated lists, dropping anything
+/// that would break the format (embedded newlines, NULs) or is empty.
+fn newline_list(entries: impl Iterator<Item = String>) -> CString {
+    let joined = entries
+        .map(|entry| entry.replace(['\n', '\r', '\0'], " ").trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    CString::new(joined).unwrap_or_default()
+}
+
 /// Widen a bare language code to the region variant Apple's recognizer
 /// expects ("de" → "de-DE"). Tags with a region pass through.
 fn widen_language(code: &str) -> String {
@@ -239,6 +269,8 @@ impl<R: Runtime> Recognizer for Stt<R> {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let locale = CString::new(widen_language(&config.language))
             .map_err(|_| crate::Error::ConfigError("Invalid language tag".to_string()))?;
+        let extra_locales = newline_list(config.extra_languages.iter().map(|l| widen_language(l)));
+        let contextual_strings = newline_list(config.contextual_strings.iter().cloned());
         sessions()
             .lock()
             .map_err(|_| crate::Error::Recording("Session registry poisoned".to_string()))?
@@ -251,6 +283,8 @@ impl<R: Runtime> Recognizer for Stt<R> {
                 config.sample_rate as f64,
                 config.interim_results as u32,
                 config.on_device as u32,
+                extra_locales.as_ptr(),
+                contextual_strings.as_ptr(),
             )
         };
         if code != 0 {
