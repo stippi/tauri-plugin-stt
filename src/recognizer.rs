@@ -24,7 +24,7 @@ pub type Sample = i16;
 
 /// What the recognizer heard, delivered through the callback handed to
 /// [`Recognizer::open`]. Callbacks may run on any thread and must not block.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RecognizerEvent {
     /// Refined hypothesis for the utterance in progress. Replaces the previous
     /// `Partial`; not yet committed.
@@ -34,6 +34,17 @@ pub enum RecognizerEvent {
     /// hosts append them; Apple's recognizer emits the whole session's
     /// transcript once, on `finish`.
     Final(String),
+    /// One language's transcript in a session that listened in several
+    /// languages (`RecognizerConfig::extra_languages`, iOS 26+). Delivered
+    /// for every language that heard something — only when at least two did
+    /// — right before the `Final`, which repeats the most confident one.
+    Alternative {
+        /// The language tag the transcript is in ("fr-FR").
+        language: String,
+        text: String,
+        /// 0.0–1.0, `None` when the engine gave none.
+        confidence: Option<f64>,
+    },
     /// The recognizer failed. `Ended` follows.
     Error(String),
     /// No further events will be delivered for this session.
@@ -43,7 +54,7 @@ pub enum RecognizerEvent {
 pub type RecognizerCallback = Box<dyn Fn(RecognizerEvent) + Send + Sync + 'static>;
 
 /// How to open a session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RecognizerConfig {
     /// BCP-47 language tag ("de-DE"). Bare codes ("de") are widened by the
     /// platform binding where it can.
@@ -57,6 +68,14 @@ pub struct RecognizerConfig {
     /// on-device regardless. Ignored on desktop, where recognition is always
     /// local.
     pub on_device: bool,
+    /// Further languages to listen for in the same session, alongside
+    /// `language` (iOS 26+: one on-device analyzer each; see
+    /// `RecognizerEvent::Alternative`). A language joins once its model is
+    /// ready — call [`Recognizer::prepare`] for it first. Ignored on desktop.
+    pub extra_languages: Vec<String>,
+    /// Words and phrases to expect (names, technical terms, foreign words),
+    /// biasing recognition towards them. Best effort; ignored by Vosk.
+    pub contextual_strings: Vec<String>,
 }
 
 /// An open, buffer-fed recognition session.

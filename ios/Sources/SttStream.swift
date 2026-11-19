@@ -32,6 +32,16 @@ func rust_stt_stream_on_ended(_ id: UInt64)
 @_silgen_name("rust_stt_stream_on_model_progress")
 func rust_stt_stream_on_model_progress(_ percent: Int32)
 
+/// One language's transcript in a multi-language session, before the final.
+/// `confidence` is 0...1, or negative when unknown.
+@_silgen_name("rust_stt_stream_on_alternative")
+func rust_stt_stream_on_alternative(
+    _ id: UInt64,
+    _ locale: UnsafePointer<CChar>,
+    _ text: UnsafePointer<CChar>,
+    _ confidence: Double
+)
+
 /// Error codes returned by `stt_stream_start`. Mirrored in Rust.
 private enum StreamStartError: Int32 {
     case ok = 0
@@ -55,6 +65,43 @@ protocol RecognitionStream: AnyObject {
     func cancel()
 }
 
+/// Where an `AnalyzerStream` reports: straight to Rust (`RustSink`) or to a
+/// `MultiAnalyzerStream` that merges several languages.
+protocol StreamSink: AnyObject {
+    func partial(_ text: String)
+    /// The session's transcript; `confidence` 0...1 when the engine has one.
+    func final(_ text: String, confidence: Double?)
+    func error(_ message: String)
+    /// Last event; nothing follows.
+    func ended()
+}
+
+/// Reports a session's events to Rust under its id.
+final class RustSink: StreamSink {
+    let id: UInt64
+
+    init(id: UInt64) {
+        self.id = id
+    }
+
+    func partial(_ text: String) {
+        text.withCString { rust_stt_stream_on_partial(id, $0) }
+    }
+
+    func final(_ text: String, confidence: Double?) {
+        text.withCString { rust_stt_stream_on_final(id, $0) }
+    }
+
+    func error(_ message: String) {
+        message.withCString { rust_stt_stream_on_error(id, $0) }
+    }
+
+    func ended() {
+        rust_stt_stream_on_ended(id)
+        SttStreamRegistry.shared.remove(id)
+    }
+}
+
 /// One `SFSpeechRecognizer` session fed from Rust.
 private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate, RecognitionStream {
     let id: UInt64
@@ -67,7 +114,14 @@ private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate, Rec
     private var finishing = false
     private var lastHypothesis: String = ""
 
-    init?(id: UInt64, locale: Locale, sampleRate: Double, interimResults: Bool, onDevice: Bool) {
+    init?(
+        id: UInt64,
+        locale: Locale,
+        sampleRate: Double,
+        interimResults: Bool,
+        onDevice: Bool,
+        contextualStrings: [String]
+    ) {
         guard let recognizer = SFSpeechRecognizer(locale: locale) else { return nil }
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -88,6 +142,9 @@ private final class SpeechStream: NSObject, SFSpeechRecognitionTaskDelegate, Rec
         }
         if onDevice, recognizer.supportsOnDeviceRecognition {
             request.requiresOnDeviceRecognition = true
+        }
+        if !contextualStrings.isEmpty {
+            request.contextualStrings = contextualStrings
         }
         super.init()
     }
@@ -255,14 +312,29 @@ public func stt_stream_request_authorization() -> Int32 {
     return stt_stream_authorization_status()
 }
 
+/// Newline-separated list from Rust, empty entries dropped.
+private func lines(_ ptr: UnsafePointer<CChar>?) -> [String] {
+    guard let ptr = ptr else { return [] }
+    return String(cString: ptr)
+        .split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+}
+
 /// Start a session. Returns 0 on success or a `StreamStartError` code.
+///
+/// `extraLocales` (newline-separated, may be empty) are further languages to
+/// recognize alongside `locale` (iOS 26+, see `MultiAnalyzerStream`);
+/// `contextualStrings` (newline-separated) are words to expect.
 @_cdecl("stt_stream_start")
 public func stt_stream_start(
     _ id: UInt64,
     _ locale: UnsafePointer<CChar>,
     _ sampleRate: Double,
     _ interimResults: UInt32,
-    _ onDevice: UInt32
+    _ onDevice: UInt32,
+    _ extraLocales: UnsafePointer<CChar>?,
+    _ contextualStrings: UnsafePointer<CChar>?
 ) -> Int32 {
     guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
         return StreamStartError.notAuthorized.rawValue
@@ -271,19 +343,38 @@ public func stt_stream_start(
         return StreamStartError.alreadyRunning.rawValue
     }
     let localeId = String(cString: locale)
+    let extras = lines(extraLocales).filter { $0 != localeId }
+    let terms = lines(contextualStrings)
     // iOS 26+: Apple's newer on-device model, when it covers the locale and
     // its assets are installed (a missing asset starts downloading in the
     // background and this session falls back to SFSpeechRecognizer).
     if #available(iOS 26, macOS 26, *) {
-        if let stream = AnalyzerStream.open(
+        if !extras.isEmpty {
+            if let stream = MultiAnalyzerStream.open(
+                id: id,
+                locales: ([localeId] + extras).map { Locale(identifier: $0) },
+                sampleRate: sampleRate,
+                interimResults: interimResults != 0,
+                contextualStrings: terms
+            ) {
+                SttStreamRegistry.shared.insert(stream)
+                stream.start()
+                NSLog("[SttStream %llu] started SpeechAnalyzer/multi [%@] (%.0f Hz, %ld terms)",
+                      id, stream.moduleNames, sampleRate, terms.count)
+                return StreamStartError.ok.rawValue
+            }
+        } else if let stream = AnalyzerStream.open(
             id: id,
             locale: Locale(identifier: localeId),
             sampleRate: sampleRate,
-            interimResults: interimResults != 0
+            interimResults: interimResults != 0,
+            contextualStrings: terms,
+            sink: RustSink(id: id)
         ) {
             SttStreamRegistry.shared.insert(stream)
             stream.start()
-            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz)", id, stream.moduleName, localeId, sampleRate)
+            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz, %ld terms)",
+                  id, stream.moduleName, localeId, sampleRate, terms.count)
             return StreamStartError.ok.rawValue
         }
     }
@@ -292,7 +383,8 @@ public func stt_stream_start(
         locale: Locale(identifier: localeId),
         sampleRate: sampleRate,
         interimResults: interimResults != 0,
-        onDevice: onDevice != 0
+        onDevice: onDevice != 0,
+        contextualStrings: terms
     ) else {
         // SFSpeechRecognizer(locale:) is nil for unsupported locales; the
         // format initializer only fails for absurd sample rates.

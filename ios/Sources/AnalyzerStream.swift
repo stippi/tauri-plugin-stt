@@ -6,8 +6,9 @@ import Speech
 // MARK: - SpeechAnalyzer-backed recognition (iOS 26+)
 //
 // Same contract as `SpeechStream` (see SttStream.swift): Rust pushes PCM via
-// `feed`, results go back through the `rust_stt_stream_*` callbacks — one
-// `Final` with the whole session's transcript on `finish`, then `Ended`.
+// `feed`, results go to a `StreamSink` — one `final` with the whole session's
+// transcript on `finish`, then `ended`. The sink is `RustSink` for a plain
+// session, or a `MultiAnalyzerStream` collecting one candidate per language.
 //
 // What differs from `SFSpeechRecognizer`:
 // - Always on-device. The model is a system asset (`AssetInventory`), shared
@@ -29,6 +30,12 @@ final class AnalyzerStream: RecognitionStream {
     let id: UInt64
     /// "SpeechTranscriber" or "DictationTranscriber", for logs.
     let moduleName: String
+    /// The locale this stream was opened for (as requested by the host).
+    let locale: Locale
+    private let sink: StreamSink
+    /// Words the recognizer should expect (`AnalysisContext`), applied before
+    /// analysis starts.
+    private let contextualStrings: [String]
 
     private let queue: DispatchQueue
     private let analyzer: SpeechAnalyzer
@@ -48,6 +55,9 @@ final class AnalyzerStream: RecognitionStream {
     // Session state, only touched on `queue`.
     private var finalized = ""
     private var volatile = ""
+    /// Confidence of the finalized text, weighted by characters.
+    private var confidenceSum = 0.0
+    private var confidenceChars = 0
     private var ended = false
     private var finishing = false
     /// The results sequence ended on its own: the analyzer is done and needs
@@ -59,8 +69,19 @@ final class AnalyzerStream: RecognitionStream {
     /// it so a very short session never finalizes an analyzer not yet started.
     private var startTask: Task<Void, Never>?
 
-    private init(id: UInt64, prepared: PreparedAnalyzer, sourceFormat: AVAudioFormat, interimResults: Bool) {
+    private init(
+        id: UInt64,
+        locale: Locale,
+        prepared: PreparedAnalyzer,
+        sourceFormat: AVAudioFormat,
+        interimResults: Bool,
+        contextualStrings: [String],
+        sink: StreamSink
+    ) {
         self.id = id
+        self.locale = locale
+        self.sink = sink
+        self.contextualStrings = contextualStrings
         self.moduleName = prepared.moduleName
         self.queue = DispatchQueue(label: "com.yellowbites.stt-analyzer.\(id)", qos: .userInteractive)
         self.analyzer = prepared.analyzer
@@ -82,11 +103,20 @@ final class AnalyzerStream: RecognitionStream {
     /// `SFSpeechRecognizer` instead.
     ///
     /// With an analyzer prepared in advance (`prewarm`) this returns
-    /// immediately. Otherwise it **blocks** on the Speech framework's async
-    /// setup — call it off the main thread; Rust's `Recognizer::open` already
-    /// runs on a blocking-capable thread. Either way the next session's
-    /// analyzer is prepared in the background right after.
-    static func open(id: UInt64, locale: Locale, sampleRate: Double, interimResults: Bool) -> AnalyzerStream? {
+    /// immediately. Otherwise, with `waitForSetup`, it **blocks** on the
+    /// Speech framework's async setup — call it off the main thread; Rust's
+    /// `Recognizer::open` already runs on a blocking-capable thread — and
+    /// without it returns nil. Either way the next session's analyzer is
+    /// prepared in the background right after.
+    static func open(
+        id: UInt64,
+        locale: Locale,
+        sampleRate: Double,
+        interimResults: Bool,
+        contextualStrings: [String] = [],
+        waitForSetup: Bool = true,
+        sink: StreamSink
+    ) -> AnalyzerStream? {
         guard let sourceFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: sampleRate,
@@ -97,6 +127,8 @@ final class AnalyzerStream: RecognitionStream {
         let prepared: PreparedAnalyzer?
         if interimResults, let warm = AnalyzerPool.shared.take(locale: locale) {
             prepared = warm
+        } else if !waitForSetup {
+            prepared = nil
         } else {
             // Model loading is the slow part. If setup takes longer than
             // this, the session goes to SFSpeechRecognizer and the late
@@ -106,7 +138,10 @@ final class AnalyzerStream: RecognitionStream {
             } ?? nil
         }
         guard let prepared = prepared else { return nil }
-        let stream = AnalyzerStream(id: id, prepared: prepared, sourceFormat: sourceFormat, interimResults: interimResults)
+        let stream = AnalyzerStream(
+            id: id, locale: locale, prepared: prepared, sourceFormat: sourceFormat,
+            interimResults: interimResults, contextualStrings: contextualStrings, sink: sink
+        )
         guard stream.converter != nil || sourceFormat == prepared.targetFormat else {
             NSLog("[AnalyzerStream %llu] cannot convert %@ to %@", id,
                   sourceFormat.description, prepared.targetFormat.description)
@@ -134,7 +169,19 @@ final class AnalyzerStream: RecognitionStream {
             self.resultsTask = self.consumeResults(self)
             let analyzer = self.analyzer
             let input = self.inputStream
+            let strings = self.contextualStrings
+            let id = self.id
             self.startTask = Task {
+                if !strings.isEmpty {
+                    let context = AnalysisContext()
+                    context.contextualStrings[.general] = strings
+                    do {
+                        try await analyzer.setContext(context)
+                    } catch {
+                        // Hints are best effort; recognition works without.
+                        NSLog("[AnalyzerStream %llu] setContext failed: %@", id, error.localizedDescription)
+                    }
+                }
                 do {
                     try await analyzer.start(inputSequence: input)
                 } catch {
@@ -189,19 +236,23 @@ final class AnalyzerStream: RecognitionStream {
 
     // MARK: Results (any thread → queue)
 
-    fileprivate func receive(_ text: String, isFinal: Bool) {
+    /// `confidence` is the result's character-weighted confidence sum and
+    /// the number of characters it covers (see `weightedConfidence`).
+    fileprivate func receive(_ text: String, isFinal: Bool, confidence: (sum: Double, chars: Int)) {
         queue.async {
             guard !self.ended else { return }
             if isFinal {
                 self.finalized += text
                 self.volatile = ""
+                self.confidenceSum += confidence.sum
+                self.confidenceChars += confidence.chars
             } else {
                 self.volatile = text
             }
             guard self.interimResults else { return }
             let partial = self.transcript
             if !partial.isEmpty {
-                partial.withCString { rust_stt_stream_on_partial(self.id, $0) }
+                self.sink.partial(partial)
             }
         }
     }
@@ -227,7 +278,7 @@ final class AnalyzerStream: RecognitionStream {
                 self.emitFinalAndEnd()
                 return
             }
-            error.localizedDescription.withCString { rust_stt_stream_on_error(self.id, $0) }
+            self.sink.error(error.localizedDescription)
             self.end()
         }
     }
@@ -243,7 +294,8 @@ final class AnalyzerStream: RecognitionStream {
         guard !ended else { return }
         let text = transcript
         if !text.isEmpty {
-            text.withCString { rust_stt_stream_on_final(self.id, $0) }
+            let confidence = confidenceChars > 0 ? confidenceSum / Double(confidenceChars) : nil
+            sink.final(text, confidence: confidence)
         }
         end()
     }
@@ -259,8 +311,7 @@ final class AnalyzerStream: RecognitionStream {
             stopAnalyzer()
         }
         resultsTask?.cancel()
-        rust_stt_stream_on_ended(id)
-        SttStreamRegistry.shared.remove(id)
+        sink.ended()
     }
 
     private func closeInput() {
@@ -401,15 +452,22 @@ struct TranscriberChoice {
     static func pick(locale: Locale, interimResults: Bool) async -> TranscriberChoice? {
         if SpeechTranscriber.isAvailable,
            let matched = await SpeechTranscriber.supportedLocale(equivalentTo: locale) {
+            let preset: SpeechTranscriber.Preset = interimResults ? .progressiveTranscription : .transcription
             let module = SpeechTranscriber(
                 locale: matched,
-                preset: interimResults ? .progressiveTranscription : .transcription
+                transcriptionOptions: preset.transcriptionOptions,
+                reportingOptions: preset.reportingOptions,
+                attributeOptions: preset.attributeOptions.union([.transcriptionConfidence])
             )
             return TranscriberChoice(moduleName: "SpeechTranscriber", module: module, locale: matched) { stream in
                 Task {
                     do {
                         for try await result in module.results {
-                            stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                            stream.receive(
+                                String(result.text.characters),
+                                isFinal: result.isFinal,
+                                confidence: weightedConfidence(result.text)
+                            )
                         }
                         stream.resultsEnded(nil)
                     } catch {
@@ -419,15 +477,23 @@ struct TranscriberChoice {
             }
         }
         if let matched = await DictationTranscriber.supportedLocale(equivalentTo: locale) {
+            let preset: DictationTranscriber.Preset = interimResults ? .progressiveLongDictation : .longDictation
             let module = DictationTranscriber(
                 locale: matched,
-                preset: interimResults ? .progressiveLongDictation : .longDictation
+                contentHints: preset.contentHints,
+                transcriptionOptions: preset.transcriptionOptions,
+                reportingOptions: preset.reportingOptions,
+                attributeOptions: preset.attributeOptions.union([.transcriptionConfidence])
             )
             return TranscriberChoice(moduleName: "DictationTranscriber", module: module, locale: matched) { stream in
                 Task {
                     do {
                         for try await result in module.results {
-                            stream.receive(String(result.text.characters), isFinal: result.isFinal)
+                            stream.receive(
+                                String(result.text.characters),
+                                isFinal: result.isFinal,
+                                confidence: weightedConfidence(result.text)
+                            )
                         }
                         stream.resultsEnded(nil)
                     } catch {
@@ -438,6 +504,22 @@ struct TranscriberChoice {
         }
         return nil
     }
+}
+
+/// Character-weighted confidence of a transcriber result: the sum of
+/// confidence × characters over runs that carry a confidence, and how many
+/// characters that covers.
+@available(iOS 26, macOS 26, *)
+func weightedConfidence(_ text: AttributedString) -> (sum: Double, chars: Int) {
+    var sum = 0.0
+    var chars = 0
+    for run in text.runs {
+        guard let confidence = run.transcriptionConfidence else { continue }
+        let count = text[run.range].characters.count
+        sum += confidence * Double(count)
+        chars += count
+    }
+    return (sum, chars)
 }
 
 // MARK: - Model assets (status and foreground install)
