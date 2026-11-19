@@ -359,7 +359,7 @@ public func stt_stream_start(
             ) {
                 SttStreamRegistry.shared.insert(stream)
                 stream.start()
-                NSLog("[SttStream %llu] started SpeechAnalyzer/multi [%@] (%.0f Hz, %d terms)",
+                NSLog("[SttStream %llu] started SpeechAnalyzer/multi [%@] (%.0f Hz, %ld terms)",
                       id, stream.moduleNames, sampleRate, terms.count)
                 return StreamStartError.ok.rawValue
             }
@@ -373,7 +373,7 @@ public func stt_stream_start(
         ) {
             SttStreamRegistry.shared.insert(stream)
             stream.start()
-            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz, %d terms)",
+            NSLog("[SttStream %llu] started SpeechAnalyzer/%@ (%@, %.0f Hz, %ld terms)",
                   id, stream.moduleName, localeId, sampleRate, terms.count)
             return StreamStartError.ok.rawValue
         }

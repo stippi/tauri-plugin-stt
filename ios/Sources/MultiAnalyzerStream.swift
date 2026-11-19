@@ -23,7 +23,7 @@ final class MultiAnalyzerStream: RecognitionStream {
 
     // Only touched on `queue`.
     private var finals: [Int: (text: String, confidence: Double?)] = [:]
-    private var errors: [String] = []
+    private var errors: [Int: String] = [:]
     private var endedCount = 0
     private var done = false
 
@@ -68,7 +68,7 @@ final class MultiAnalyzerStream: RecognitionStream {
             }
             stream.children.append(child)
         }
-        NSLog("[MultiAnalyzerStream %llu] %@ + %d extra language(s)",
+        NSLog("[MultiAnalyzerStream %llu] %@ + %ld extra language(s)",
               id, primary.identifier, stream.children.count - 1)
         return stream
     }
@@ -111,8 +111,8 @@ final class MultiAnalyzerStream: RecognitionStream {
 
     fileprivate func childError(_ index: Int, _ message: String) {
         queue.async {
-            NSLog("[MultiAnalyzerStream %llu] language %d failed: %@", self.id, index, message)
-            self.errors.append(message)
+            NSLog("[MultiAnalyzerStream %llu] language %ld failed: %@", self.id, index, message)
+            self.errors[index] = message
         }
     }
 
@@ -132,7 +132,10 @@ final class MultiAnalyzerStream: RecognitionStream {
         let candidates = finals
             .sorted { $0.key < $1.key }
             .filter { !$0.value.text.isEmpty }
-        if candidates.isEmpty, let message = errors.first, errors.count == children.count {
+        // Nothing heard and the primary language failed: report its error,
+        // as a single-language session would, instead of silence. A failed
+        // extra language alone is no reason to fail the utterance.
+        if candidates.isEmpty, let message = errors[0] {
             message.withCString { rust_stt_stream_on_error(id, $0) }
         }
         if candidates.count > 1 {
