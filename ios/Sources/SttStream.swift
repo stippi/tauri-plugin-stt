@@ -439,9 +439,9 @@ public func stt_stream_model_status(_ locale: UnsafePointer<CChar>) -> Int32 {
 }
 
 /// Download and install the analyzer assets for `locale`, reporting progress
-/// through `rust_stt_stream_on_model_progress` (0–99). Blocks until done.
-/// Returns `SpeechAssets.InstallResult` (0 installed, 1 unsupported,
-/// 2 failed); 0 before iOS 26.
+/// through `rust_stt_stream_on_model_progress` (0–99). Blocks until done or
+/// until the download stops moving. Returns `SpeechAssets.InstallResult`
+/// (0 installed, 1 unsupported, 2 failed, 3 stalled); 0 before iOS 26.
 @_cdecl("stt_stream_install_model")
 public func stt_stream_install_model(_ locale: UnsafePointer<CChar>) -> Int32 {
     let localeId = String(cString: locale)

@@ -553,39 +553,131 @@ enum SpeechAssets {
         case installed = 0
         case unsupported = 1
         case failed = 2
+        /// The download made no progress for `stallTimeout`. It is left
+        /// running in the system (it may still finish); the host stops
+        /// waiting and can offer a retry.
+        case stalled = 3
     }
+
+    /// How long an install may go without progress before `install` stops
+    /// waiting for it. Seen right after an OS update: Apple's asset download
+    /// sat at 0 % until the app was restarted.
+    static let stallTimeout: TimeInterval = 180
 
     /// Download and install the assets, reporting progress (whole percent,
     /// deduplicated) through `onProgress`; then prepare an analyzer so the
-    /// next session starts warm.
+    /// next session starts warm. Returns `.stalled` when the download stops
+    /// moving for `stallTimeout`.
     static func install(locale: Locale, onProgress: @escaping (Int32) -> Void) async -> InstallResult {
         guard let choice = await TranscriberChoice.pick(locale: locale, interimResults: true) else {
             return .unsupported
         }
+        let request: AssetInstallationRequest?
         do {
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: [choice.module]) {
-                NSLog("[AnalyzerStream] installing speech assets for %@", choice.key)
-                var last: Int32 = -1
-                let lock = NSLock()
-                let observation = request.progress.observe(\.fractionCompleted, options: [.initial, .new]) { progress, _ in
-                    let percent = Int32((progress.fractionCompleted * 100).rounded(.down))
-                    let changed = lock.withLock { () -> Bool in
-                        guard percent != last else { return false }
-                        last = percent
-                        return true
-                    }
-                    if changed { onProgress(min(percent, 99)) }
-                }
-                defer { observation.invalidate() }
-                try await request.downloadAndInstall()
-                NSLog("[AnalyzerStream] speech assets for %@ installed", choice.key)
-            }
+            request = try await AssetInventory.assetInstallationRequest(supporting: [choice.module])
         } catch {
             NSLog("[AnalyzerStream] asset install for %@ failed: %@", choice.key, error.localizedDescription)
             return .failed
         }
+        if let request {
+            NSLog("[AnalyzerStream] installing speech assets for %@", choice.key)
+            let clock = ProgressClock()
+            let observation = request.progress.observe(\.fractionCompleted, options: [.initial, .new]) { progress, _ in
+                let percent = Int32((progress.fractionCompleted * 100).rounded(.down))
+                if clock.advance(to: percent) { onProgress(min(percent, 99)) }
+            }
+            defer { observation.invalidate() }
+            switch await downloadOrStall(request, clock: clock) {
+            case .installed:
+                NSLog("[AnalyzerStream] speech assets for %@ installed", choice.key)
+            case .failed(let message):
+                NSLog("[AnalyzerStream] asset install for %@ failed: %@", choice.key, message)
+                return .failed
+            case .stalled:
+                NSLog(
+                    "[AnalyzerStream] asset install for %@ made no progress for %.0fs — no longer waiting",
+                    choice.key, stallTimeout
+                )
+                return .stalled
+            }
+        }
         AnalyzerStream.prewarm(locale: locale)
         return .installed
+    }
+
+    private enum DownloadOutcome: Sendable {
+        case installed
+        case failed(String)
+        case stalled
+    }
+
+    /// Race the download against the stall clock. The download runs in a
+    /// task of its own that a stall does not cancel: the system may still
+    /// complete it, and a later `install` then finds the assets in place.
+    private static func downloadOrStall(
+        _ request: AssetInstallationRequest,
+        clock: ProgressClock
+    ) async -> DownloadOutcome {
+        await withCheckedContinuation { (continuation: CheckedContinuation<DownloadOutcome, Never>) in
+            let once = ResumeOnce(continuation)
+            Task {
+                do {
+                    try await request.downloadAndInstall()
+                    once.resume(.installed)
+                } catch {
+                    once.resume(.failed(error.localizedDescription))
+                }
+            }
+            Task {
+                while !once.isDone {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    if clock.secondsSinceProgress() >= stallTimeout {
+                        once.resume(.stalled)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// When an install last moved, and the percent it moved to.
+private final class ProgressClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: Int32 = -1
+    private var movedAt = Date()
+
+    /// Record `percent`; true when it differs from the last one.
+    func advance(to percent: Int32) -> Bool {
+        lock.withLock {
+            guard percent != last else { return false }
+            last = percent
+            movedAt = Date()
+            return true
+        }
+    }
+
+    func secondsSinceProgress() -> TimeInterval {
+        lock.withLock { Date().timeIntervalSince(movedAt) }
+    }
+}
+
+/// Resumes a continuation exactly once, whichever racer comes first.
+private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<T, Never>?
+
+    init(_ continuation: CheckedContinuation<T, Never>) {
+        self.continuation = continuation
+    }
+
+    var isDone: Bool { lock.withLock { continuation == nil } }
+
+    func resume(_ value: T) {
+        let pending = lock.withLock { () -> CheckedContinuation<T, Never>? in
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume(returning: value)
     }
 }
 
