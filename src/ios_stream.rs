@@ -51,6 +51,9 @@ const MODEL_DOWNLOADING: i32 = 3;
 // Install results (mirror Swift `SpeechAssets.InstallResult`).
 const INSTALL_OK: i32 = 0;
 const INSTALL_UNSUPPORTED: i32 = 1;
+/// `SpeechAssets.InstallResult.stalled`: the download stopped moving; it may
+/// still finish in the system, the caller can retry later.
+const INSTALL_STALLED: i32 = 3;
 
 type ProgressSink = Box<dyn Fn(u8) + Send + Sync>;
 
@@ -348,6 +351,9 @@ impl<R: Runtime> Recognizer for Stt<R> {
             }
             INSTALL_UNSUPPORTED => Err(crate::Error::NotAvailable(format!(
                 "No on-device speech model for {tag}"
+            ))),
+            INSTALL_STALLED => Err(crate::Error::NotAvailable(format!(
+                "The speech model download for {tag} made no progress; try again later"
             ))),
             _ => Err(crate::Error::NotAvailable(format!(
                 "Installing the speech model for {tag} failed"
